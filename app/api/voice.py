@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import os
+import random
 import re
 import uuid
 import wave
@@ -16,6 +17,7 @@ from app.database import get_db
 from app.models.user import User
 from app.models.voice_session import VoiceSession
 from app.models.voice_conversation_turn import VoiceConversationTurn
+from app.models.four_choice_question import FourChoiceQuestion
 from ai_agent.prompts import AI_MC_SYSTEM_PROMPT
 from ai_agent.live_context_graph import get_live_context_graph
 
@@ -485,3 +487,158 @@ async def psych_test_result(
         "audio": audio_b64,
         "mime_type": mime_type,
     }
+
+
+# ----- 4지 선다 퀴즈 질문 생성: 세션 → 유저 interests/이름 기반 상대방 퀴즈, DB 저장 + 음성 -----
+
+
+def _parse_four_choice(llm_output: str) -> tuple[str, str, str, str, str] | None:
+    """LLM 출력에서 QUESTION, CORRECT, WRONG1, WRONG2, WRONG3 파싱. 실패 시 None."""
+    text = (llm_output or "").strip()
+    patterns = [
+        (r"(?:QUESTION|질문)\s*[:：]\s*(.+?)(?=(?:CORRECT|정답)|$)", "q"),
+        (r"(?:CORRECT|정답)\s*[:：]\s*(.+?)(?=(?:WRONG|오답)|\n\n|$)", "c"),
+        (r"(?:WRONG1|오답1)\s*[:：]\s*(.+?)(?=(?:WRONG2|오답2)|\n|$)", "w1"),
+        (r"(?:WRONG2|오답2)\s*[:：]\s*(.+?)(?=(?:WRONG3|오답3)|\n|$)", "w2"),
+        (r"(?:WRONG3|오답3)\s*[:：]\s*(.+)", "w3"),
+    ]
+    found = {}
+    for pat, key in patterns:
+        m = re.search(pat, text, re.DOTALL | re.IGNORECASE)
+        if m:
+            found[key] = m.group(1).strip()
+    if len(found) == 5:
+        return (found["q"], found["c"], found["w1"], found["w2"], found["w3"])
+    return None
+
+
+@router.post("/four-choice-quiz")
+async def four_choice_quiz(
+    session_id: Annotated[str, Form(description="세션 ID")],
+    db: Session = Depends(get_db),
+):
+    """
+    세션 ID로 두 유저를 조회한 뒤, 각자의 interests·이름을 활용해
+    상대방에 대한 4지 선다 퀴즈 2개 생성(각 1개씩). 질문 ID 부여 후 DB 저장하고,
+    질문 텍스트, 정답 포함 4가지 선택지, 상대방 이름 포함 TTS 음성을 프론트로 반환.
+    """
+    session_id = (session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id는 필수입니다.")
+
+    first_session = (
+        db.query(VoiceSession)
+        .filter(VoiceSession.session_id == session_id)
+        .order_by(VoiceSession.created_at)
+        .first()
+    )
+    if not first_session:
+        raise HTTPException(status_code=400, detail="해당 session_id를 찾을 수 없습니다.")
+    user_id_1, user_id_2 = first_session.user_id_1, first_session.user_id_2
+
+    users = db.query(User).filter(User.userId.in_([user_id_1, user_id_2])).all()
+    if len(users) != 2:
+        try:
+            u1 = db.query(User).filter(User.id == int(user_id_1)).first()
+            u2 = db.query(User).filter(User.id == int(user_id_2)).first()
+            users = [u for u in (u1, u2) if u is not None]
+        except (ValueError, TypeError):
+            pass
+    if len(users) == 2:
+        if getattr(users[0], "userId", None) == user_id_1:
+            user1, user2 = users[0], users[1]
+        else:
+            user1, user2 = users[1], users[0]
+        name1 = getattr(user1, "name", "참가자1")
+        name2 = getattr(user2, "name", "참가자2")
+        interests1 = getattr(user1, "interests", []) or []
+        interests2 = getattr(user2, "interests", []) or []
+        interests1_str = ", ".join(str(x) for x in interests1) if isinstance(interests1, list) else str(interests1)
+        interests2_str = ", ".join(str(x) for x in interests2) if isinstance(interests2, list) else str(interests2)
+    else:
+        name1, name2 = "참가자1", "참가자2"
+        interests1_str = interests2_str = "일반"
+
+    from quiz_chain import get_llm
+
+    def generate_one_question(about_name: str, about_interests: str) -> tuple[str, str, str, str, str] | None:
+        system = (
+            "당신은 소개팅/미팅 MC입니다. 주어진 참가자(이름, 관심사)에 대한 **4지 선다 퀴즈**를 하나 만드세요. "
+            "관심사를 활용해 그 사람을 맞히는 재미있는 질문으로. "
+            "반드시 아래 형식으로만 출력하세요.\n"
+            "QUESTION: (질문 원본 한 문장)\n"
+            "CORRECT: (정답 한 개)\n"
+            "WRONG1: (오답 1)\nWRONG2: (오답 2)\nWRONG3: (오답 3)"
+        )
+        user_content = f"참가자 이름: {about_name}\n관심사: {about_interests}\n\n위 참가자에 대한 4지 선다 퀴즈 하나를 QUESTION/CORRECT/WRONG1~3 형식으로 출력하세요."
+        messages = [SystemMessage(content=system), HumanMessage(content=user_content)]
+        try:
+            response = get_llm().invoke(messages)
+            raw = (response.content if hasattr(response, "content") else str(response)).strip()
+            return _parse_four_choice(raw)
+        except Exception:
+            return None
+
+    results = []
+    # 퀴즈 1: user2에 대한 퀴즈 (user1이 풀 때 상대방 이름 = name2)
+    parsed1 = generate_one_question(name2, interests2_str)
+    if parsed1:
+        q_id_1 = str(uuid.uuid4())
+        q_text_1, correct_1, wrong1_1, wrong2_1, wrong3_1 = parsed1
+        db.add(
+            FourChoiceQuestion(
+                question_id=q_id_1,
+                session_id=session_id,
+                question_text=q_text_1,
+                correct_answer=correct_1,
+                wrong_answer_1=wrong1_1,
+                wrong_answer_2=wrong2_1,
+                wrong_answer_3=wrong3_1,
+                about_user_name=name2,
+            )
+        )
+        db.commit()
+        choices_1 = [{"text": correct_1, "is_correct": True}, {"text": wrong1_1, "is_correct": False}, {"text": wrong2_1, "is_correct": False}, {"text": wrong3_1, "is_correct": False}]
+        random.shuffle(choices_1)
+        tts_text_1 = f"{name2}에 대한 퀴즈입니다. {q_text_1}"
+        audio_1, mime_1 = _reply_and_tts(tts_text_1)
+        results.append({
+            "question_id": q_id_1,
+            "question_text": q_text_1,
+            "choices": choices_1,
+            "audio": audio_1,
+            "mime_type": mime_1,
+        })
+    # 퀴즈 2: user1에 대한 퀴즈 (user2가 풀 때 상대방 이름 = name1)
+    parsed2 = generate_one_question(name1, interests1_str)
+    if parsed2:
+        q_id_2 = str(uuid.uuid4())
+        q_text_2, correct_2, wrong1_2, wrong2_2, wrong3_2 = parsed2
+        db.add(
+            FourChoiceQuestion(
+                question_id=q_id_2,
+                session_id=session_id,
+                question_text=q_text_2,
+                correct_answer=correct_2,
+                wrong_answer_1=wrong1_2,
+                wrong_answer_2=wrong2_2,
+                wrong_answer_3=wrong3_2,
+                about_user_name=name1,
+            )
+        )
+        db.commit()
+        choices_2 = [{"text": correct_2, "is_correct": True}, {"text": wrong1_2, "is_correct": False}, {"text": wrong2_2, "is_correct": False}, {"text": wrong3_2, "is_correct": False}]
+        random.shuffle(choices_2)
+        tts_text_2 = f"{name1}에 대한 퀴즈입니다. {q_text_2}"
+        audio_2, mime_2 = _reply_and_tts(tts_text_2)
+        results.append({
+            "question_id": q_id_2,
+            "question_text": q_text_2,
+            "choices": choices_2,
+            "audio": audio_2,
+            "mime_type": mime_2,
+        })
+
+    if not results:
+        raise HTTPException(status_code=502, detail="퀴즈 생성에 실패했습니다.")
+    return {"questions": results}
