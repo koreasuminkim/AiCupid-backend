@@ -6,9 +6,15 @@ STT(음성→텍스트) → LLM(텍스트→응답 생성) → TTS(텍스트→�
 ## 주요 특징 및 구조
 
 - FastAPI 기반 Python 서버
-- WebSocket을 통한 실시간 음성/텍스트 대화
-- STT, LLM, TTS(예: Gemini, Supertone 등) 연동
+- Next.js 기반 프론트엔드
+- STT, LLM, TTS 연동
 - SQLite 기반 데이터베이스
+
+## 주요 기능
+
+- 음성 채팅 기능
+- 심리 테스트, 밸런스 게임, 퀴즈 등의 미니게임
+- 관심사에 따른 주제 추천
 
 ### 처리 흐름
 
