@@ -70,6 +70,13 @@ def read_root():
 def health():
     return {"status": "ok"}
 
+@app.on_event("startup")
+async def startup_event():
+    # LangGraph 전용 체크포인트 테이블 생성 (Postgres 사용 시 필수)
+    if not SQLALCHEMY_DATABASE_URL.startswith("sqlite"):
+        from services.agent import memory
+        memory.setup()
+
 
 @app.get("/docs/websocket-test", response_class=HTMLResponse)
 def docs_websocket_test():
