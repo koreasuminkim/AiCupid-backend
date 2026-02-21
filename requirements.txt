@@ -7,3 +7,4 @@ fastapi
 gunicorn
 google-cloud-speech
 elevenlabs
+python-dotenv
