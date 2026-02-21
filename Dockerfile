@@ -15,7 +15,9 @@ RUN uv pip install --system --no-cache -r requirements.txt
 COPY . .
 
 # 8000번 포트를 외부에 노출합니다.
-EXPOSE 8000
+# Railway는 PORT 환경 변수를 자동으로 설정하므로 EXPOSE는 주석 처리하거나 삭제할 수 있습니다.
+# EXPOSE 8000
 
 # uv를 사용하여 uvicorn으로 애플리케이션을 실행합니다.
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Railway가 제공하는 PORT 환경 변수를 사용하도록 --port 인자를 $PORT로 설정합니다.
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT"]
