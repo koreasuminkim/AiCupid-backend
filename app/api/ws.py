@@ -29,6 +29,7 @@ async def websocket_quiz_endpoint(websocket: WebSocket):
                     
                     # 1. STT
                     transcript = await speech_to_text_gemini(raw_pcm)
+                    print(f"[STT] {transcript}")  # 터미널에 음성→텍스트 결과 출력
                     await websocket.send_json({"type": "final_transcript", "text": transcript})
 
                     # 2. Agent Invoke
