@@ -8,9 +8,8 @@ from live_bridge import run_live_session
 
 router = APIRouter(prefix="/ws", tags=["websocket"])
 
-@router.websocket("/quiz")
-async def websocket_quiz_endpoint(websocket: WebSocket):
-    await websocket.accept()
+async def _run_quiz_voice_loop(websocket: WebSocket):
+    """음성 청크 수신 → STT → 퀴즈 에이전트 → TTS 응답 (공통 로직)."""
     session_id = websocket.query_params.get("session_id", str(uuid4()))
     config = {"configurable": {"thread_id": session_id}}
     runnable = get_app_runnable() 
@@ -26,9 +25,10 @@ async def websocket_quiz_endpoint(websocket: WebSocket):
                 if data.get("type") == "speech_end" and audio_chunks:
                     raw_pcm = b"".join(audio_chunks)
                     audio_chunks = []
-                    
+
                     # 1. STT
                     transcript = await speech_to_text_gemini(raw_pcm)
+                    print(f"[STT] {transcript}")
                     await websocket.send_json({"type": "final_transcript", "text": transcript})
 
                     # 2. Agent Invoke
@@ -45,6 +45,20 @@ async def websocket_quiz_endpoint(websocket: WebSocket):
                     })
     except WebSocketDisconnect:
         print(f"Disconnected: {session_id}")
+
+
+@router.websocket("/quiz")
+async def websocket_quiz_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    await _run_quiz_voice_loop(websocket)
+
+
+@router.websocket("/audio")
+async def websocket_audio_endpoint(websocket: WebSocket):
+    """/ws/quiz와 동일한 음성→STT→퀴즈→TTS 흐름 (호환용 별칭)."""
+    await websocket.accept()
+    await _run_quiz_voice_loop(websocket)
+
 
 @router.websocket("/live")
 async def websocket_live_endpoint(websocket: WebSocket):

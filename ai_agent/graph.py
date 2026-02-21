@@ -9,7 +9,9 @@ import operator
 from typing import Annotated, TypedDict
 
 from langgraph.graph import END, StateGraph
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+from ai_agent.prompts import AI_MC_SYSTEM_PROMPT
 from quiz_chain import QuizGrader, QuestionProvider, quiz_data, get_llm, get_react_chain
 
 
@@ -90,9 +92,18 @@ def build_quiz_graph() -> StateGraph:
 
     def chat_node(state: AgentState):
         messages = state.get("messages") or []
-        # [변경] LLM 인스턴스를 직접 생성하지 않고 싱글톤 헬퍼(get_llm)를 통해 호출
-        response = get_llm().invoke(messages)
-        return {"messages": [response]}
+        # AI MC 역할(roles): 소개팅 상황에서 어색하지 않게 정보 전달
+        lc_messages = [SystemMessage(content=AI_MC_SYSTEM_PROMPT)]
+        for m in messages:
+            if isinstance(m, (list, tuple)) and len(m) >= 2:
+                role, content = m[0], m[1]
+            else:
+                role, content = "user", str(m)
+            text = content if isinstance(content, str) else getattr(content, "content", str(content))
+            lc_messages.append(HumanMessage(content=text) if role == "user" else AIMessage(content=text))
+        response = get_llm().invoke(lc_messages)
+        ai_content = response.content if hasattr(response, "content") else str(response)
+        return {"messages": [("ai", ai_content)]}
 
     # [추가] 조건부 엣지(conditional_edges)에서 사용할 상태 판단 전용 헬퍼 함수 분리
     def decide_next_step(state: AgentState):
