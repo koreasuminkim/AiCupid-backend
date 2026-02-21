@@ -10,6 +10,7 @@ from app.schemas.user import UserProfile, ProfileUpdateRequest, MatchableUserLis
 from services.s3_service import upload_file_to_s3_raw
 from fastapi import Query
 from sqlalchemy import func
+from services.youtube_service import fetch_youtube_subscriptions, analyze_interests_with_llm
 
 router = APIRouter(prefix="/api/users", tags=["users"])
 
@@ -117,7 +118,7 @@ async def get_matchable_users(
         # 기준이 없으면 최신 가입 순으로만 정렬
         sorted_users = sorted(all_users, key=lambda u: u.id, reverse=True)
 
-    # 4. 페이지네이션 슬라이싱
+    # 4. 페이지네이션 슬라이싱  
     paginated_users = sorted_users[skip : skip + limit]
     
     # 5. 응답 데이터 변환
@@ -136,4 +137,37 @@ async def get_matchable_users(
     return {
         "users": result,
         "total_count": len(all_users)
+    }
+
+@router.post("/sync-youtube")
+async def sync_youtube_interests(
+    request: dict, # {"access_token": "..."}
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    access_token = request.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=400, detail="Google Access Token이 필요합니다.")
+    
+    # 1. 유튜브에서 구독 채널 이름들 긁어오기
+    channels = fetch_youtube_subscriptions(access_token)
+    if not channels:
+        return {"status": "error", "message": "구독 목록을 가져올 수 없거나 목록이 비어있습니다."}
+    
+    # 2. LLM으로 분석
+    analysis = await analyze_interests_with_llm(channels)
+    if not analysis:
+        raise HTTPException(status_code=500, detail="취향 분석 중 오류가 발생했습니다.")
+    
+    # 3. DB 업데이트
+    current_user.interests = analysis["interests"]
+    
+    db.commit()
+    db.refresh(current_user)
+    
+    return {
+        "status": "ok",
+        "updated_data": {
+            "interests": current_user.interests,
+        }
     }
