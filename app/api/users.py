@@ -6,7 +6,10 @@ from app.models.user import User
 from app.schemas.user import UserProfile
 from app.schemas.user import ProfileUpdateRequest
 from app.api.auth import get_current_user
+from app.schemas.user import UserProfile, ProfileUpdateRequest, MatchableUserListResponse, MatchableUserResponse
 from services.s3_service import upload_file_to_s3_raw
+from fastapi import Query
+from sqlalchemy import func
 
 router = APIRouter(prefix="/api/users", tags=["users"])
 
@@ -69,3 +72,68 @@ async def get_my_profile(current_user: User = Depends(get_current_user)):
         bio=current_user.bio,
         profileImage=current_user.profile_image_url
     )
+
+@router.get("/matchable", response_model=MatchableUserListResponse)
+async def get_matchable_users(
+    skip: int = 0,
+    limit: int = 20,
+    sort_by: str = Query(None, description="정렬 기준: mbti, interests"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    페이지네이션과 다중 조건 정렬 알고리즘이 적용된 매칭 유저 목록 조회
+    """
+    # 1. 기본 필터: 본인 제외
+    query = db.query(User).filter(User.userId != current_user.userId)
+    all_users = query.all()
+
+    # 2. 추천 점수 계산 함수 (1순위 기준용)
+    def calculate_primary_score(other_user: User):
+        score = 0
+        if sort_by == "mbti" and current_user.mbti and other_user.mbti:
+            m1, m2 = current_user.mbti.upper(), other_user.mbti.upper()
+            score = sum(1 for a, b in zip(m1, m2) if a == b)
+        elif sort_by == "interests":
+            c_ints = set(current_user.interests or [])
+            o_ints = set(other_user.interests or [])
+            score = len(c_ints & o_ints)
+        return score
+
+    # 3. 다중 조건 정렬 (Python의 sorted는 stable 하므로 튜플을 이용해 한 번에 정렬)
+    # (점수 내림차순, 나이차이 오름차순, ID 내림차순)
+    # reverse=True를 사용하므로, 오름차순을 원하는 값(나이차이)은 음수로 처리합니다.
+    if sort_by in ["mbti", "interests"]:
+        sorted_users = sorted(
+            all_users, 
+            key=lambda u: (
+                calculate_primary_score(u),            # 1순위: 점수 (높을수록 앞)
+                -abs(current_user.age - u.age),        # 2순위: 나이차 적을수록 앞 (음수로 큰 값이 됨)
+                u.id                                   # 3순위: 최신 가입자 (ID 클수록 앞)
+            ), 
+            reverse=True
+        )
+    else:
+        # 기준이 없으면 최신 가입 순으로만 정렬
+        sorted_users = sorted(all_users, key=lambda u: u.id, reverse=True)
+
+    # 4. 페이지네이션 슬라이싱
+    paginated_users = sorted_users[skip : skip + limit]
+    
+    # 5. 응답 데이터 변환
+    result = [
+        MatchableUserResponse(
+            userId=u.userId,
+            name=u.name,
+            age=u.age,
+            gender=u.gender,
+            mbti=u.mbti,
+            interests=u.interests,
+            profileImage=u.profile_image_url
+        ) for u in paginated_users
+    ]
+
+    return {
+        "users": result,
+        "total_count": len(all_users)
+    }
