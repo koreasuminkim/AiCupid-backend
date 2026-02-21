@@ -55,3 +55,12 @@ class RegisterRequest(BaseModel): # 회원가입 요청
 class LoginRequest(BaseModel): # 로그인 요청
     userId: str
     password: str
+
+class ProfileUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    gender: Optional[str] = None
+    age: Optional[int] = None
+    interests: Optional[List[str]] = None
+    mbti: Optional[str] = None
+    bio: Optional[str] = None
+    profileImage: Optional[str] = None # Base64 string

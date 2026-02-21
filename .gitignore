@@ -26,3 +26,15 @@ wheels/
 repomix-output.xml
 
 *.venv
+__pycache__/
+*.pyc
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local generated files
+repomix-output.xml
+
+# Langgraph local state
+.langgraph_api/
