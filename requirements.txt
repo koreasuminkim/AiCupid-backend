@@ -8,3 +8,8 @@ gunicorn
 python-dotenv
 elevenlabs
 google-cloud-speech
+langsmith
+langgraph
+langgraph-checkpoint-sqlite
+gTTS
+openai

@@ -1,0 +1,1833 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+.env.example
+.gitignore
+config.py
+main.py
+package.json
+quiz_chain.py
+README.md
+requirements.txt
+services/agent.py
+services/voice.py
+src/config.ts
+src/db.ts
+src/events/engine.ts
+src/events/quiz-agent.ts
+src/events/quiz-rule.ts
+src/events/types.ts
+src/gemini-text.ts
+src/gemini.ts
+src/index.ts
+src/stt.ts
+src/supertone.ts
+src/types.ts
+src/ws-handler.ts
+tsconfig.json
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="config.py">
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class Settings:
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    PORT = int(os.getenv("PORT", 8000))
+
+settings = Settings()
+</file>
+
+<file path="services/agent.py">
+import operator
+import sqlite3
+from typing import TypedDict, Annotated
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+# 지연 로딩을 위한 싱글톤 변수
+_app_runnable = None
+
+class AgentState(TypedDict):
+    messages: Annotated[list, operator.add]
+    question_id: int
+    score: int
+    next_action: str
+
+def get_app_runnable():
+    global _app_runnable
+    if _app_runnable is not None:
+        return _app_runnable
+
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    from quiz_chain import QuizGrader, QuestionProvider, quiz_data
+
+    llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0)
+
+    # --- 기존 노드 로직 (동일) ---
+    def router_node(state: AgentState):
+        messages = state["messages"]
+        last_message = messages[-1]
+        action = "chat"
+        
+        # 퀴즈 시작 키워드 체크
+        if "퀴즈" in last_message[1] and "시작" in last_message[1]:
+            return {"next_action": "ask"}
+
+        # 메시지가 2개 이상일 때만 이전 AI 메시지 확인
+        if len(messages) >= 2:
+            prev_role, prev_msg = messages[-2]
+            if state["question_id"] < len(quiz_data):
+                if prev_role == "ai" and "질문" in prev_msg:
+                    action = "grade"
+                else:
+                    action = "ask"
+            else:
+                action = "finish"
+        
+        return {"next_action": action}
+
+    def grade_answer_node(state: AgentState):
+        user_answer = state["messages"][-1][1]
+        q_id = state["question_id"]
+        grader = QuizGrader(user_answer=user_answer, question_id=q_id)
+        is_correct = grader.grade()
+        new_score = state["score"] + (1 if is_correct else 0)
+        msg = f"정답입니다! 현재 점수: {new_score}" if is_correct else f"아쉽네요. 정답은 '{quiz_data[q_id]['answer']}'입니다."
+        return {"messages": [("ai", msg)], "score": new_score, "question_id": q_id + 1}
+
+    def ask_question_node(state: AgentState):
+        q_id = state["question_id"]
+        question = QuestionProvider(question_id=q_id).get_question()
+        return {"messages": [("ai", f"퀴즈 질문입니다: {question}")]}
+
+    def chat_node(state: AgentState):
+        response = llm.invoke(state["messages"])
+        return {"messages": [response]}
+
+    # --- 그래프 빌드 ---
+    workflow = StateGraph(AgentState)
+    workflow.add_node("router", router_node)
+    workflow.add_node("grade_answer", grade_answer_node)
+    workflow.add_node("ask_question", ask_question_node)
+    workflow.add_node("chat", chat_node)
+    
+    workflow.set_entry_point("router")
+    workflow.add_conditional_edges("router", lambda x: x["next_action"], 
+                                 {"grade": "grade_answer", "ask": "ask_question", "chat": "chat", "finish": END})
+    workflow.add_edge("grade_answer", "router")
+    workflow.add_edge("ask_question", "router")
+    workflow.add_edge("chat", "router")
+
+    # --- SQLite 체크포인터 설정 ---
+    # 파일 이름을 'checkpoints.db'로 설정하여 데이터를 로컬에 물리적으로 저장합니다.
+    memory = SqliteSaver.from_conn_string("checkpoints.db")
+    _app_runnable = workflow.compile(checkpointer=memory)
+    
+    return _app_runnable
+</file>
+
+<file path="services/voice.py">
+import io
+import wave
+import base64
+from langchain_google_genai import ChatGoogleGenerativeAI
+from google.cloud import texttospeech
+from gtts import gTTS
+import openai
+import io
+
+# ── 헬퍼: Raw PCM을 Gemini가 인식 가능한 WAV로 변환 ──
+def _pcm_to_wav(raw_pcm: bytes, sample_rate: int = 16000) -> bytes:
+    with io.BytesIO() as wav_io:
+        with wave.open(wav_io, 'wb') as wav_file:
+            wav_file.setnchannels(1)  # Mono
+            wav_file.setsampwidth(2)  # 16-bit
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(raw_pcm)
+        return wav_io.getvalue()
+
+# ── STT: Gemini 1.5 Flash ──
+async def speech_to_text_gemini(raw_pcm: bytes, sample_rate: int = 16000) -> str:
+    model = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
+    wav_data = _pcm_to_wav(raw_pcm, sample_rate)
+    audio_b64 = base64.b64encode(wav_data).decode("utf-8")
+    
+    response = model.invoke([
+        {"text": "Transcribe the following audio exactly into Korean text. Return ONLY the text."},
+        {"inline_data": {"mime_type": "audio/wav", "data": audio_b64}}
+    ])
+    return response.content.strip()
+
+
+async def text_to_speech_openai(text: str) -> bytes:
+    client = openai.AsyncOpenAI() # API 키 설정 필요
+    response = await client.audio.speech.create(
+        model="tts-1",
+        voice="alloy", # 원하는 목소리 선택
+        input=text,
+        response_format="wav" # 여기서 wav로 지정
+    )
+    return response.content
+
+"""
+    # ── TTS: Google Cloud TTS ──
+    async def text_to_speech_google(text: str) -> bytes:
+        client = texttospeech.TextToSpeechClient()
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="ko-KR", 
+            name="ko-KR-Standard-A", # 테스트용 여성 음성
+            ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
+        )
+        # 프론트 명세에 맞춰 WAV 형식으로 생성
+        audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.LINEAR16)
+
+        response = client.synthesize_speech(
+            input=synthesis_input, voice=voice, audio_config=audio_config
+        )
+        return response.audio_content
+"""
+</file>
+
+<file path=".gitignore">
+node_modules/
+dist/
+
+# Environment variables (API keys — DO NOT commit)
+.env
+
+# SQLite database files
+*.db
+*.db-shm
+*.db-wal
+
+# macOS
+.DS_Store
+</file>
+
+<file path="package.json">
+{
+  "name": "aimc-backend",
+  "version": "1.0.0",
+  "description": "AI MC Backend — WebSocket + Gemini + SQLite",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@google/genai": "^1.42.0",
+    "better-sqlite3": "^9.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.2",
+    "uuid": "^9.0.0",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.8",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.0",
+    "@types/uuid": "^9.0.7",
+    "@types/ws": "^8.5.10",
+    "tsx": "^4.7.1",
+    "typescript": "^5.3.3"
+  }
+}
+</file>
+
+<file path="quiz_chain.py">
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
+
+# LLM 모델 초기화
+llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0)
+
+# 퀴즈 질문과 정답 데이터
+quiz_data = [
+    {"question": "대한민국의 수도는 어디인가요?", "answer": "서울"},
+    {"question": "세상에서 가장 높은 산은 무엇인가요?", "answer": "에베레스트"},
+    {"question": "미국의 초대 대통령은 누구인가요?", "answer": "조지 워싱턴"},
+]
+
+# --- 퀴즈 진행 및 채점을 위한 도구(Tool) 정의 ---
+
+class QuizGrader(BaseModel):
+    """사용자의 답변이 퀴즈의 정답과 일치하는지 채점합니다."""
+    user_answer: str = Field(description="사용자의 답변")
+    question_id: int = Field(description="현재 질문의 ID")
+    
+    def grade(self) -> bool:
+        """정답이면 True, 오답이면 False를 반환합니다."""
+        correct_answer = quiz_data[self.question_id]["answer"]
+        return self.user_answer.strip() == correct_answer
+
+class QuestionProvider(BaseModel):
+    """다음 퀴즈 질문을 제공합니다."""
+    question_id: int = Field(description="제공할 질문의 ID")
+
+    def get_question(self) -> str:
+        """해당 ID의 질문을 반환합니다."""
+        if self.question_id < len(quiz_data):
+            return quiz_data[self.question_id]["question"]
+        return "모든 퀴즈가 종료되었습니다."
+
+# --- LangChain을 이용한 체인 정의 ---
+
+# 사용자의 답변을 평가(채점)하기 위한 프롬프트 및 체인
+grade_answer_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "당신은 퀴즈 채점 전문가입니다. 사용자의 답변 '{user_answer}'가 질문 '{question}'의 정답 '{correct_answer}'와 일치하는지 판단해주세요. '정답' 또는 '오답'으로만 대답해주세요.",
+        ),
+    ]
+)
+
+def get_grading_chain():
+    return grade_answer_prompt | llm
+
+# 다음 행동을 결정하기 위한 프롬프트 및 체인
+# 이 체인은 LLM이 다음에 어떤 도구(QuizGrader, QuestionProvider)를 사용해야 할지 결정하도록 합니다.
+react_prompt = """당신은 대화의 흐름을 관리하는 AI 에이전트입니다. 
+대화 기록과 사용 가능한 도구를 바탕으로 다음에 어떤 행동을 해야 할지 결정하세요.
+
+사용 가능한 도구:
+- QuizGrader: 사용자의 답변을 채점합니다.
+- QuestionProvider: 다음 질문을 물어봅니다.
+
+대화 기록:
+{messages}
+
+현재 퀴즈 상태:
+- 현재 질문 ID: {question_id}
+- 점수: {score}
+
+사용자의 최근 입력: "{last_message}"
+
+위 정보를 바탕으로, 다음에 호출해야 할 도구와 그 도구에 전달할 인자를 JSON 형식으로 응답해주세요.
+만약 더 이상 진행할 퀴즈가 없다면 "finished"라고 응답하세요.
+일반적인 대화라면 "chat"이라고 응답하세요.
+"""
+
+def get_react_chain():
+    # llm_with_tools = llm.bind_tools([QuizGrader, QuestionProvider])
+    # 이 부분은 추후 LangGraph의 AgentExecutor와 통합됩니다.
+    # 지금은 개념 설명을 위해 프롬프트를 통한 의사결정 체인을 구성합니다.
+    return ChatPromptTemplate.from_template(react_prompt) | llm
+</file>
+
+<file path="README.md">
+# AIMC Backend
+
+WebSocket 서버. Gemini Live API를 통해 실시간 AI MC 음성 대화를 처리하고, Supertone TTS 모드를 지원합니다.
+
+## 기술 스택
+
+| 레이어           | 기술                                      |
+| ---------------- | ----------------------------------------- |
+| 런타임           | Node.js + TypeScript (`tsx`)              |
+| 웹 프레임워크    | Express                                   |
+| 실시간 통신      | WebSocket (`ws`)                          |
+| AI (오디오 모드) | Gemini Live API — 음성 직접 생성          |
+| AI (텍스트 모드) | Gemini Live API TEXT + Supertone REST TTS |
+| DB               | SQLite (`better-sqlite3`)                 |
+
+## 디렉터리 구조
+
+```
+backend/
+├── src/
+│   ├── config.ts        ← ✏️  동작 설정 (페르소나·모델·퀴즈·Supertone)
+│   ├── index.ts         ← 서버 진입점 (Express + WebSocketServer)
+│   ├── ws-handler.ts    ← WebSocket 연결 처리 & 이벤트 디스패치
+│   ├── gemini.ts        ← Gemini Live AUDIO 세션
+│   ├── gemini-text.ts   ← Gemini Live TEXT 세션 (Supertone 모드)
+│   ├── supertone.ts     ← Supertone REST TTS 호출
+│   ├── db.ts            ← SQLite CRUD
+│   ├── types.ts         ← WebSocket 메시지 타입
+│   └── events/          ← 이벤트 엔진
+│       ├── types.ts     ← TurnContext, MCEvent 유니온, EventTrigger 인터페이스
+│       ├── engine.ts    ← 트리거 플러그인 레지스트리 & 코디네이터
+│       ├── quiz-rule.ts ← 룰 기반 퀴즈 트리거 (매 N턴)
+│       └── quiz-agent.ts← LLM 에이전트 기반 퀴즈 트리거
+└── .env                 ← API 키 (아래 참조)
+```
+
+## 이벤트 엔진 (`src/events/`)
+
+매 대화 턴이 끝날 때마다 등록된 **EventTrigger** 플러그인들이 병렬로 실행됩니다.
+트리거가 이벤트를 발화해야 한다고 판단하면 `MCEvent`를 반환하고, `ws-handler.ts`가 이를 클라이언트로 전송합니다.
+
+### 새 이벤트 추가하기
+
+**1. `events/types.ts`에 이벤트 타입 추가**
+```ts
+export type MCEvent =
+  | { type: "quiz"; payload: QuizQuestion[] }
+  | { type: "crowd_cheer"; payload: { intensity: number } }  // ← 추가
+  ;
+```
+
+**2. 트리거 파일 생성**
+```ts
+// events/crowd-cheer-rule.ts
+export class CrowdCheerTrigger implements EventTrigger {
+  readonly name = "crowd-cheer-rule";
+  async onTurn(ctx: TurnContext): Promise<MCEvent | null> {
+    // 판단 로직 ...
+    return { type: "crowd_cheer", payload: { intensity: 0.8 } };
+  }
+}
+```
+
+**3. `ws-handler.ts`에 등록 & 처리**
+```ts
+// 등록
+const eventEngine = new EventEngine()
+  .register(new QuizRuleTrigger())
+  .register(new CrowdCheerTrigger());  // ← 추가
+
+// dispatchEvent() 에 case 추가
+case "crowd_cheer": { send(ws, { type: "crowd_cheer", ...event.payload }); break; }
+```
+
+### 룰 베이스 ↔ LLM 에이전트 전환
+
+`ws-handler.ts` 상단의 주석을 토글하면 됩니다:
+
+```ts
+const eventEngine = new EventEngine()
+  .register(new QuizRuleTrigger());      // 룰 기반
+  // .register(new QuizAgentTrigger());  // LLM 에이전트
+```
+
+## 설정 파일 (`src/config.ts`)
+
+**동작을 바꾸고 싶을 때는 이 파일만 수정하세요.**
+
+| 섹션        | 내용                                               |
+| ----------- | -------------------------------------------------- |
+| `MODELS`    | Gemini 모델 이름 (Live Audio / Live Text / Quiz용) |
+| `SUPERTONE` | TTS 언어·스타일·모델                               |
+| `QUIZ`      | 퀴즈 트리거 주기, 히스토리 창 크기, 생성 프롬프트  |
+| `PERSONAS`  | AI MC 페르소나 이름 + 시스템 프롬프트              |
+
+페르소나 추가 예시:
+
+```ts
+// src/config.ts
+export const PERSONAS: Record<string, PersonaConfig> = {
+  // ... 기존 페르소나
+  comedian: {
+    name: "The Comedian",
+    prompt: `You are a stand-up comedian MC. ...`,
+  },
+};
+```
+
+## 환경 변수 (`.env`)
+
+```env
+GEMINI_API_KEY=<Gemini API 키>
+SUPERTONE_API_KEY=<Supertone API 키>
+SUPERTONE_VOICE_ID=<Supertone 보이스 ID>
+PORT=8080                          # 선택 (기본: 8080)
+FRONTEND_ORIGIN=http://localhost:3000  # 선택 (CORS)
+```
+
+## 실행
+
+```bash
+# 개발 (파일 변경 시 자동 재시작)
+npm run dev
+
+# 프로덕션 빌드 & 실행
+npm run build
+npm start
+```
+
+## WebSocket 프로토콜
+
+### Client → Server
+
+| 타입          | 설명                                                           |
+| ------------- | -------------------------------------------------------------- |
+| `init`        | 세션 시작. `personaId`, `ttsMode?("gemini"\|"supertone")` 포함 |
+| `audio_chunk` | PCM 16kHz Base64 청크 (마이크 스트리밍)                        |
+| `quiz_answer` | 퀴즈 답변 제출                                                 |
+
+### Server → Client
+
+| 타입            | 설명                                        |
+| --------------- | ------------------------------------------- |
+| `session_ready` | 세션 준비 완료                              |
+| `transcript`    | 사용자 발화 텍스트 (STT)                    |
+| `ai_text`       | AI 텍스트 응답 (Supertone 모드)             |
+| `ai_audio`      | AI 오디오 청크 (`done:true`로 턴 종료 신호) |
+| `avatar_state`  | `idle\|listening\|thinking\|speaking`       |
+| `quiz`          | 퀴즈 문제 배열                              |
+| `error`         | 에러 메시지                                 |
+
+## TTS 모드 비교
+
+|                   | Gemini Live 모드  | Supertone 모드             |
+| ----------------- | ----------------- | -------------------------- |
+| `ttsMode`         | `"gemini"` (기본) | `"supertone"`              |
+| 오디오 형식       | PCM 24kHz         | MP3                        |
+| 지연              | 낮음 (스트리밍)   | 보통 (REST 호출)           |
+| 음성 커스터마이징 | Gemini 기본음     | Supertone 보이스 선택 가능 |
+</file>
+
+<file path="src/config.ts">
+/**
+ * ╔══════════════════════════════════════════════════════╗
+ * ║              AIMC  –  Configuration                  ║
+ * ║  모든 동작 관련 상수를 이 파일에서 관리합니다.           ║
+ * ╚══════════════════════════════════════════════════════╝
+ */
+
+// ── AI Models ─────────────────────────────────────────────
+export const MODELS = {
+    /** Gemini Live (audio streaming + built-in VAD) */
+    LIVE_AUDIO: "gemini-2.5-flash-native-audio-preview-12-2025",
+    /** Gemini Live (text output, for Supertone TTS mode) */
+    LIVE_TEXT: "gemini-2.0-flash-live-001",
+    /** Standard text model — quiz generation etc. */
+    TEXT: "gemini-2.0-flash",
+} as const;
+
+// ── Supertone TTS ─────────────────────────────────────────
+export const SUPERTONE = {
+    BASE_URL: "https://supertoneapi.com",
+    /** TTS synthesis language code */
+    LANGUAGE: "ko",
+    /** Voice style — see Supertone docs for options */
+    STYLE: "neutral",
+    /** TTS model */
+    MODEL: "sona_speech_1",
+} as const;
+
+// ── Quiz ──────────────────────────────────────────────────
+export const QUIZ = {
+    /** Trigger a quiz every N user messages */
+    TRIGGER_EVERY_N_MESSAGES: 5,
+    /** How many recent messages to include in quiz context */
+    HISTORY_WINDOW: 20,
+    /** Max conversation turns fed into the quiz generation prompt */
+    PROMPT_HISTORY_LIMIT: 12,
+    /** Prompt sent to the text model for quiz generation */
+    GENERATION_PROMPT: (conversationText: string) =>
+        `Based on this conversation, create 1-2 trivia quiz questions about topics that were discussed.
+Return ONLY a JSON array (no markdown):
+[{"id":"q1","question":"...","answers":["A","B","C","D"],"correctIndex":0,"timeLimit":20}]
+
+Conversation:
+${conversationText}`,
+} as const;
+
+// ── Persona System Prompts ────────────────────────────────
+/**
+ * Each persona defines:
+ *   - name:   display name
+ *   - prompt: system instruction sent to Gemini
+ *
+ * Add or edit personas here — no other file needs to change.
+ */
+export interface PersonaConfig {
+    name: string;
+    prompt: string;
+}
+
+export const PERSONAS: Record<string, PersonaConfig> = {
+    hypebot: {
+        name: "HypeBot",
+        prompt: `You are HypeBot, an ultra-high-energy AI MC. Use short punchy sentences, occasional ALL CAPS for emphasis, and lots of enthusiasm. Keep every response to 2-3 sentences max. You're hosting a live event and love engaging the crowd.`,
+    },
+
+    oracle: {
+        name: "The Oracle",
+        prompt: `You are The Oracle, a calm, philosophical AI MC who speaks with measured wisdom. Use thoughtful metaphors and reflective language. Keep every response to 2-3 sentences max.`,
+    },
+
+    roastmaster: {
+        name: "Roastmaster",
+        prompt: `You are the Roastmaster, an edgy comedic AI MC who lightly roasts everything with wit. Keep jokes sharp but never mean. Keep every response to 2-3 sentences max.`,
+    },
+
+    narrator: {
+        name: "The Narrator",
+        prompt: `You are The Narrator, a dramatic storytelling AI MC. Frame everything as an epic tale with vivid language and dramatic pauses (marked with '...'). Keep every response to 2-3 sentences max.`,
+    },
+};
+
+/** Returns the system prompt for a given persona ID (falls back to oracle). */
+export function getPersonaPrompt(personaId: string): string {
+    return (PERSONAS[personaId] ?? PERSONAS.oracle).prompt;
+}
+</file>
+
+<file path="src/db.ts">
+import Database from "better-sqlite3";
+import path from "path";
+import type { Message, QuizQuestion } from "./types";
+
+const DB_PATH = path.resolve(process.cwd(), "aimc.db");
+let db: Database.Database;
+
+export function initDB(): void {
+  db = new Database(DB_PATH);
+  db.pragma("journal_mode = WAL");
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id         TEXT    PRIMARY KEY,
+      persona_id TEXT    NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS messages (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT    NOT NULL,
+      role       TEXT    NOT NULL CHECK(role IN ('user','assistant')),
+      content    TEXT    NOT NULL,
+      timestamp  INTEGER NOT NULL,
+      FOREIGN KEY (session_id) REFERENCES sessions(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS quizzes (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id   TEXT    NOT NULL,
+      questions    TEXT    NOT NULL,
+      triggered_at INTEGER NOT NULL,
+      FOREIGN KEY (session_id) REFERENCES sessions(id)
+    );
+  `);
+  console.log(`[DB] Ready at ${DB_PATH}`);
+}
+
+export function createSession(id: string, personaId: string): void {
+  db.prepare(
+    "INSERT INTO sessions (id, persona_id, created_at) VALUES (?, ?, ?)"
+  ).run(id, personaId, Date.now());
+}
+
+export function addMessage(
+  sessionId: string,
+  role: "user" | "assistant",
+  content: string
+): void {
+  db.prepare(
+    "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)"
+  ).run(sessionId, role, content, Date.now());
+}
+
+/** Returns messages newest-first, up to `limit`. Caller reverses if needed. */
+export function getMessages(sessionId: string, limit = 10): Message[] {
+  return db
+    .prepare(
+      `SELECT role, content, timestamp
+       FROM messages
+       WHERE session_id = ?
+       ORDER BY timestamp DESC
+       LIMIT ?`
+    )
+    .all(sessionId, limit) as Message[];
+}
+
+export function getUserMessageCount(sessionId: string): number {
+  const row = db
+    .prepare(
+      "SELECT COUNT(*) as count FROM messages WHERE session_id = ? AND role = 'user'"
+    )
+    .get(sessionId) as { count: number };
+  return row.count;
+}
+
+export function saveQuiz(sessionId: string, questions: QuizQuestion[]): void {
+  db.prepare(
+    "INSERT INTO quizzes (session_id, questions, triggered_at) VALUES (?, ?, ?)"
+  ).run(sessionId, JSON.stringify(questions), Date.now());
+}
+</file>
+
+<file path="src/events/engine.ts">
+/**
+ * ─────────────────────────────────────────────────────────────────
+ *  EventEngine — 트리거 플러그인 레지스트리 & 코디네이터
+ * ─────────────────────────────────────────────────────────────────
+ *
+ *  사용법:
+ *    const engine = new EventEngine();
+ *    engine.register(new QuizRuleTrigger());
+ *    engine.register(new MyCustomTrigger());
+ *
+ *    // 매 턴 완료 후:
+ *    const events = await engine.processTurn(ctx);
+ *    for (const event of events) { ... }
+ * ─────────────────────────────────────────────────────────────────
+ */
+
+import type { EventTrigger, MCEvent, TurnContext } from "./types";
+
+export class EventEngine {
+    private triggers: EventTrigger[] = [];
+
+    /** 트리거 플러그인 등록 */
+    register(trigger: EventTrigger): this {
+        this.triggers.push(trigger);
+        console.log(`[EventEngine] Registered trigger: "${trigger.name}"`);
+        return this; // 체이닝 가능: engine.register(a).register(b)
+    }
+
+    /** 등록된 모든 트리거를 병렬 실행하고, null이 아닌 이벤트만 반환 */
+    async processTurn(ctx: TurnContext): Promise<MCEvent[]> {
+        const results = await Promise.allSettled(
+            this.triggers.map((t) => t.onTurn(ctx))
+        );
+
+        const events: MCEvent[] = [];
+        for (let i = 0; i < results.length; i++) {
+            const result = results[i];
+            if (result.status === "fulfilled") {
+                if (result.value !== null) events.push(result.value);
+            } else {
+                console.error(
+                    `[EventEngine] Trigger "${this.triggers[i].name}" threw:`,
+                    result.reason
+                );
+            }
+        }
+        return events;
+    }
+}
+</file>
+
+<file path="src/events/quiz-agent.ts">
+/**
+ * ─────────────────────────────────────────────────────────────────
+ *  QuizAgentTrigger — LLM 에이전트 기반 퀴즈 트리거
+ * ─────────────────────────────────────────────────────────────────
+ *
+ *  동작: 매 턴마다 Gemini에게 "지금 퀴즈를 내기 좋은 타이밍인가?"를 묻고,
+ *        LLM이 YES라고 판단하면 퀴즈를 생성합니다.
+ *
+ *  판단 기준 예시 (프롬프트에서 정의):
+ *    - 흥미로운 주제(역사·과학·스포츠 등)가 충분히 언급됐을 때
+ *    - 사용자가 5회 이상 발화했을 때
+ *    - 직전 퀴즈로부터 최소 3턴이 지났을 때
+ * ─────────────────────────────────────────────────────────────────
+ */
+
+import { GoogleGenAI } from "@google/genai";
+import type { EventTrigger, MCEvent, TurnContext } from "./types";
+import { generateQuiz } from "../gemini";
+import { MODELS } from "../config";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+/** 에이전트 판단 프롬프트 */
+function buildDecisionPrompt(ctx: TurnContext): string {
+    const recent = ctx.history
+        .slice(-6) // 최근 6개 메시지만
+        .map((m) => `${m.role === "user" ? "Guest" : "MC"}: ${m.content}`)
+        .join("\n");
+
+    return `You are an event coordinator for a live AI MC show.
+Decide whether NOW is a good time to run a trivia quiz for the audience.
+
+Rules:
+- At least 4 user messages must have occurred (current count: ${ctx.messageCount})
+- The conversation must contain interesting facts or topics worth quizzing on
+- Don't trigger if the conversation is purely casual/emotional with no learnable content
+- Maintain at least 3 turns between quizzes
+
+Recent conversation:
+${recent}
+
+Respond with ONLY "YES" or "NO".`;
+}
+
+export class QuizAgentTrigger implements EventTrigger {
+    readonly name = "quiz-agent";
+
+    private lastTriggeredAt = -Infinity; // 마지막 퀴즈가 발생한 messageCount
+    private readonly minGap: number;
+
+    constructor({ minGap = 3 }: { minGap?: number } = {}) {
+        this.minGap = minGap;
+    }
+
+    async onTurn(ctx: TurnContext): Promise<MCEvent | null> {
+        // 최소 4회 발화 & 이전 퀴즈로부터 충분한 간격
+        if (
+            ctx.messageCount < 4 ||
+            ctx.messageCount - this.lastTriggeredAt < this.minGap
+        ) {
+            return null;
+        }
+
+        // ── LLM에게 판단 요청 ──────────────────────────────────
+        const response = await ai.models.generateContent({
+            model: MODELS.TEXT,
+            contents: [
+                { role: "user", parts: [{ text: buildDecisionPrompt(ctx) }] },
+            ],
+        });
+
+        const decision = response.text?.trim().toUpperCase();
+        console.log(
+            `[QuizAgentTrigger] Decision at message #${ctx.messageCount}: ${decision}`
+        );
+
+        if (decision !== "YES") return null;
+
+        // ── 퀴즈 생성 ─────────────────────────────────────────
+        const questions = await generateQuiz(ctx.history);
+        if (questions.length === 0) return null;
+
+        this.lastTriggeredAt = ctx.messageCount;
+        return { type: "quiz", payload: questions };
+    }
+}
+</file>
+
+<file path="src/events/quiz-rule.ts">
+/**
+ * ─────────────────────────────────────────────────────────────────
+ *  QuizRuleTrigger — 룰 베이스 퀴즈 트리거
+ * ─────────────────────────────────────────────────────────────────
+ *
+ *  동작: 세션 내 사용자 메시지 수가 N의 배수가 될 때마다 퀴즈 생성.
+ *  설정: config.ts의 QUIZ.TRIGGER_EVERY_N_MESSAGES / HISTORY_WINDOW
+ * ─────────────────────────────────────────────────────────────────
+ */
+
+import type { EventTrigger, MCEvent, TurnContext } from "./types";
+import { generateQuiz } from "../gemini";
+import { QUIZ } from "../config";
+
+export class QuizRuleTrigger implements EventTrigger {
+    readonly name = "quiz-rule";
+
+    async onTurn(ctx: TurnContext): Promise<MCEvent | null> {
+        const { messageCount, history } = ctx;
+
+        // N의 배수 턴에만 발동
+        if (messageCount <= 0 || messageCount % QUIZ.TRIGGER_EVERY_N_MESSAGES !== 0) {
+            return null;
+        }
+
+        console.log(
+            `[QuizRuleTrigger] Triggered at message #${messageCount} — generating quiz`
+        );
+
+        const questions = await generateQuiz(history);
+        if (questions.length === 0) return null;
+
+        return { type: "quiz", payload: questions };
+    }
+}
+</file>
+
+<file path="src/events/types.ts">
+/**
+ * ─────────────────────────────────────────────────────────────────
+ *  AIMC Event System — Core Types
+ * ─────────────────────────────────────────────────────────────────
+ *
+ * 이벤트 종류를 추가하려면:
+ *   1. MCEvent 유니온에 새 타입을 추가
+ *   2. events/ 폴더에 새 트리거 파일 생성
+ *   3. engine.ts에 등록
+ * ─────────────────────────────────────────────────────────────────
+ */
+
+import type { Message, QuizQuestion } from "../types";
+
+// ── 매 대화 턴에서 트리거에 전달되는 컨텍스트 ─────────────────────
+export interface TurnContext {
+    sessionId: string;
+    /** 해당 턴의 사용자 발화 텍스트 */
+    userMessage: string;
+    /** 해당 턴의 AI 텍스트 응답 (Gemini / Supertone 모드 공통) */
+    aiMessage: string;
+    /** 세션 내 누적 사용자 메시지 수 (이번 턴 포함) */
+    messageCount: number;
+    /** 최근 대화 히스토리 (DB에서 조회된 순서) */
+    history: Message[];
+}
+
+// ── 이벤트 유니온 ─────────────────────────────────────────────────
+// 새 이벤트를 추가할 때 여기에 타입을 추가하세요.
+export type MCEvent =
+    | { type: "quiz"; payload: QuizQuestion[] }
+    // 예시: 앞으로 추가할 이벤트들
+    // | { type: "crowd_cheer"; payload: { intensity: number } }
+    // | { type: "highlight_reel"; payload: { summary: string } }
+    // | { type: "vote"; payload: { question: string; options: string[] } }
+    ;
+
+// ── EventTrigger 인터페이스 ───────────────────────────────────────
+/**
+ * 이벤트 트리거 플러그인의 기본 계약(contract).
+ *
+ * 구현체는 매 턴 완료 후 onTurn()을 호출받고:
+ *   - 이벤트를 발화해야 한다면 MCEvent를 반환
+ *   - 아직 아니라면 null을 반환
+ *
+ * 여러 이벤트를 한 턴에 반환해야 한다면 MCEvent[]로 변경 가능.
+ */
+export interface EventTrigger {
+    /** 트리거 식별 이름 (로그·디버깅용) */
+    readonly name: string;
+
+    /**
+     * 매 대화 턴 완료 후 호출됩니다.
+     * @returns 발화할 이벤트, 혹은 이번 턴은 패스할 경우 null
+     */
+    onTurn(ctx: TurnContext): Promise<MCEvent | null>;
+}
+</file>
+
+<file path="src/gemini-text.ts">
+import { GoogleGenAI, Modality } from "@google/genai";
+import type { Session, LiveServerMessage } from "@google/genai";
+import { MODELS, getPersonaPrompt } from "./config";
+
+// gemini-2.0-flash-live-001 is only available on v1alpha, not v1beta
+const ai = new GoogleGenAI({
+    apiKey: process.env.GEMINI_API_KEY!,
+    httpOptions: { apiVersion: "v1alpha" },
+});
+
+// ── Callbacks for text-mode Live session ─────────────────
+export interface TextLiveCallbacks {
+    onTranscript: (text: string) => void;
+    /** Called when a full AI text response turn is complete */
+    onTextResponse: (text: string) => void;
+    onError: (error: Error) => void;
+    onClose: () => void;
+}
+
+/**
+ * Create a Gemini Live session that produces TEXT output only.
+ * Used when the client requested ttsMode = "supertone".
+ * The caller is responsible for converting the text to audio via Supertone.
+ */
+export async function createTextLiveSession(
+    personaId: string,
+    callbacks: TextLiveCallbacks
+): Promise<Session> {
+    const systemInstruction = getPersonaPrompt(personaId);
+
+    // Accumulate model text turn
+    let currentTextTurn = "";
+
+    const session = await ai.live.connect({
+        model: MODELS.LIVE_TEXT,
+        config: {
+            responseModalities: [Modality.TEXT],
+            systemInstruction: {
+                parts: [{ text: systemInstruction }],
+            },
+            inputAudioTranscription: {},
+        },
+        callbacks: {
+            onopen: () => {
+                console.log("[Gemini Text Live] Session opened");
+            },
+
+            onmessage: (msg: LiveServerMessage) => {
+                // Accumulate text parts from the model
+                const parts = msg.serverContent?.modelTurn?.parts ?? [];
+                for (const part of parts) {
+                    if (part.text) {
+                        currentTextTurn += part.text;
+                    }
+                }
+
+                // Turn complete → emit full text response
+                if (msg.serverContent?.turnComplete) {
+                    const text = currentTextTurn.trim();
+                    currentTextTurn = "";
+                    if (text) {
+                        console.log(
+                            `[Gemini Text Live] AI response: "${text.slice(0, 80)}"`
+                        );
+                        callbacks.onTextResponse(text);
+                    }
+                }
+
+                // User speech transcription
+                const transcription = msg.serverContent?.inputTranscription;
+                if (transcription?.text && transcription.finished) {
+                    callbacks.onTranscript(transcription.text);
+                }
+            },
+
+            onerror: (e: ErrorEvent) => {
+                callbacks.onError(new Error(e.message ?? "Gemini Text Live error"));
+            },
+
+            onclose: (e: CloseEvent) => {
+                console.log(
+                    `[Gemini Text Live] Session closed (code=${e?.code}, reason=${e?.reason ?? "none"})`
+                );
+                callbacks.onClose();
+            },
+        },
+    });
+
+    return session;
+}
+</file>
+
+<file path="src/gemini.ts">
+import { GoogleGenAI, Modality } from "@google/genai";
+import type { Session, LiveServerMessage } from "@google/genai";
+import type { QuizQuestion, Message } from "./types";
+import { MODELS, QUIZ, getPersonaPrompt } from "./config";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+// ── Callbacks for Live session events ────────────────────
+export interface LiveCallbacks {
+  onTranscript: (text: string) => void;
+  onAudioChunk: (base64: string, mimeType: string, done: boolean) => void;
+  onError: (error: Error) => void;
+  onClose: () => void;
+}
+
+// ── Create a Gemini Live session (AUDIO mode) ─────────────
+export async function createLiveSession(
+  personaId: string,
+  callbacks: LiveCallbacks
+): Promise<Session> {
+  const systemInstruction = getPersonaPrompt(personaId);
+
+  const session = await ai.live.connect({
+    model: MODELS.LIVE_AUDIO,
+    config: {
+      responseModalities: [Modality.AUDIO],
+      systemInstruction: {
+        parts: [{ text: systemInstruction }],
+      },
+      // Request transcription of user's speech
+      inputAudioTranscription: {},
+      // Disable server-side VAD so we can use activityStart/activityEnd manually.
+      // sendClientContent({ turnComplete }) is not valid for native audio models.
+      realtimeInputConfig: {
+        automaticActivityDetection: { disabled: true },
+      },
+    },
+    callbacks: {
+      onopen: () => {
+        console.log("[Gemini Live] Session opened");
+      },
+
+      onmessage: (msg: LiveServerMessage) => {
+        // AI audio response chunks
+        const parts = msg.serverContent?.modelTurn?.parts ?? [];
+        for (const part of parts) {
+          if (part.inlineData?.data) {
+            const mimeType = part.inlineData.mimeType ?? "audio/pcm;rate=24000";
+            callbacks.onAudioChunk(part.inlineData.data, mimeType, false);
+          }
+        }
+
+        // AI turn complete
+        if (msg.serverContent?.turnComplete) {
+          callbacks.onAudioChunk("", "audio/pcm;rate=24000", true);
+        }
+
+        // User speech transcription
+        const transcription = msg.serverContent?.inputTranscription;
+        if (transcription?.text && transcription.finished) {
+          callbacks.onTranscript(transcription.text);
+        }
+      },
+
+      onerror: (e: ErrorEvent) => {
+        callbacks.onError(new Error(e.message ?? "Gemini Live error"));
+      },
+
+      onclose: (e: CloseEvent) => {
+        console.log(`[Gemini Live] Session closed (code=${e?.code}, reason=${e?.reason ?? "none"})`);
+        callbacks.onClose();
+      },
+    },
+  });
+
+  return session;
+}
+
+// ── Send a PCM audio chunk to the live session ───────────
+export function sendAudioChunk(session: Session, base64PCM: string): void {
+  session.sendRealtimeInput({
+    audio: {
+      data: base64PCM,
+      mimeType: "audio/pcm;rate=16000",
+    },
+  });
+}
+
+// ── Close the live session ───────────────────────────────
+export function closeLiveSession(session: Session): void {
+  try {
+    session.close();
+  } catch {
+    // Already closed — ignore
+  }
+}
+
+// ── Manual activity signals (replaces auto VAD) ──────────
+// activityStart: 사용자 발화 시작 신호 (오디오 전송 전 호출)
+export function sendActivityStart(session: Session): void {
+  try {
+    session.sendRealtimeInput({ activityStart: {} });
+  } catch (err) {
+    console.warn("[Gemini Live] sendActivityStart failed:", err);
+  }
+}
+
+// activityEnd: 발화 종료 신호 → Gemini가 즉시 응답 생성 시작
+// force_commit(아바타 탭) 또는 침묵 감지 시 호출됩니다.
+export function sendActivityEnd(session: Session): void {
+  try {
+    session.sendRealtimeInput({ activityEnd: {} });
+    console.log("[Gemini Live] Force-committed current audio turn");
+  } catch (err) {
+    console.warn("[Gemini Live] sendActivityEnd failed:", err);
+  }
+}
+
+// ── Generate quiz from conversation history ──────────────
+export async function generateQuiz(
+  history: Message[]
+): Promise<QuizQuestion[]> {
+  const conversationText = [...history]
+    .reverse()
+    .slice(0, QUIZ.PROMPT_HISTORY_LIMIT)
+    .map((m) => `${m.role === "user" ? "Guest" : "MC"}: ${m.content}`)
+    .join("\n");
+
+  const result = await ai.models.generateContent({
+    model: MODELS.TEXT,
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: QUIZ.GENERATION_PROMPT(conversationText) }],
+      },
+    ],
+  });
+
+  const raw = result.text?.trim() ?? "";
+  const cleaned = raw
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```\s*$/, "")
+    .trim();
+
+  try {
+    return JSON.parse(cleaned) as QuizQuestion[];
+  } catch {
+    console.error("[Gemini] Quiz parse failed:", raw);
+    return [];
+  }
+}
+</file>
+
+<file path="src/index.ts">
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
+import http from "http";
+import { WebSocketServer } from "ws";
+import { initDB } from "./db";
+import { handleConnection } from "./ws-handler";
+
+if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "your_gemini_api_key_here") {
+  console.error("[Error] GEMINI_API_KEY is not set in .env");
+  process.exit(1);
+}
+
+const PORT = Number(process.env.PORT ?? 8080);
+
+// ── Init SQLite ───────────────────────────────────────────
+initDB();
+
+// ── Express app ───────────────────────────────────────────
+const app = express();
+app.use(cors({ origin: process.env.FRONTEND_ORIGIN ?? "http://localhost:3000" }));
+app.use(express.json({ limit: "50mb" })); // audio payloads can be large
+
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+// ── HTTP + WebSocket server ───────────────────────────────
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
+
+wss.on("connection", (ws) => {
+  handleConnection(ws);
+});
+
+server.listen(PORT, () => {
+  console.log(`[Server] HTTP  → http://localhost:${PORT}/health`);
+  console.log(`[Server] WS   → ws://localhost:${PORT}`);
+});
+</file>
+
+<file path="src/stt.ts">
+/**
+ * ─────────────────────────────────────────────────────────────────
+ *  Background STT (Speech-to-Text)
+ * ─────────────────────────────────────────────────────────────────
+ *
+ *  AI가 응답을 생성하는 동안 사용자의 발화를 PCM 청크 배열로 받아
+ *  Gemini에게 전사를 요청합니다.
+ *  결과 텍스트는 다음 턴의 컨텍스트로만 주입됩니다 (새 응답 미트리거).
+ * ─────────────────────────────────────────────────────────────────
+ */
+
+import { GoogleGenAI } from "@google/genai";
+import { MODELS } from "./config";
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+/**
+ * base64 PCM 16kHz 모노 청크 배열을 합쳐 Gemini로 전사합니다.
+ * 무음이거나 내용이 없으면 빈 문자열을 반환합니다.
+ */
+export async function transcribeBackgroundAudio(
+    base64Chunks: string[]
+): Promise<string> {
+    if (base64Chunks.length === 0) return "";
+
+    // 모든 청크를 하나의 버퍼로 합산
+    const buffers = base64Chunks.map((c) => Buffer.from(c, "base64"));
+    const combined = Buffer.concat(buffers);
+    const combinedBase64 = combined.toString("base64");
+
+    console.log(
+        `[STT] Transcribing background audio — ${(combined.byteLength / 1024).toFixed(1)} KB`
+    );
+
+    try {
+        const result = await ai.models.generateContent({
+            model: MODELS.TEXT,
+            contents: [
+                {
+                    role: "user",
+                    parts: [
+                        {
+                            text: "Transcribe the following audio exactly. Return ONLY the transcription text. If the audio is silent or unclear, return an empty string.",
+                        },
+                        {
+                            inlineData: {
+                                mimeType: "audio/pcm;rate=16000",
+                                data: combinedBase64,
+                            },
+                        },
+                    ],
+                },
+            ],
+        });
+
+        const text = result.text?.trim() ?? "";
+        console.log(`[STT] Transcription: "${text.slice(0, 80)}"`);
+        return text;
+    } catch (err) {
+        console.error("[STT] Transcription failed:", err);
+        return "";
+    }
+}
+</file>
+
+<file path="src/supertone.ts">
+/**
+ * Supertone REST API helper
+ * POST https://supertoneapi.com/v1/text-to-speech/{voiceId}
+ * Header: x-sup-api-key
+ * Response: binary audio (mp3)
+ */
+import { SUPERTONE } from "./config";
+
+const API_KEY = process.env.SUPERTONE_API_KEY!;
+const VOICE_ID = process.env.SUPERTONE_VOICE_ID!;
+
+/**
+ * Convert text to speech via Supertone API.
+ * Language, style, and model are read from config.ts (SUPERTONE.*).
+ * Returns a Buffer containing MP3 audio data.
+ */
+export async function supertoneTextToSpeech(text: string): Promise<Buffer> {
+    const url = `${SUPERTONE.BASE_URL}/v1/text-to-speech/${VOICE_ID}`;
+
+    const response = await fetch(url, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "x-sup-api-key": API_KEY,
+        },
+        body: JSON.stringify({
+            text,
+            language: SUPERTONE.LANGUAGE,
+            style: SUPERTONE.STYLE,
+            model: SUPERTONE.MODEL,
+        }),
+    });
+
+    if (!response.ok) {
+        const errText = await response.text().catch(() => "(no body)");
+        throw new Error(
+            `[Supertone] TTS request failed: ${response.status} ${response.statusText} — ${errText}`
+        );
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    console.log(
+        `[Supertone] TTS success — ${text.length} chars → ${arrayBuffer.byteLength} bytes`
+    );
+    return Buffer.from(arrayBuffer);
+}
+</file>
+
+<file path="src/types.ts">
+// Shared types between ws-handler, gemini, and db layers
+
+export interface QuizQuestion {
+  id: string;
+  question: string;
+  answers: string[];
+  correctIndex: number;
+  timeLimit: number;
+}
+
+export interface Message {
+  role: "user" | "assistant";
+  content: string;
+  timestamp: number;
+}
+
+// ── Client → Server ──────────────────────────────────────
+export type ClientMessage =
+  | { type: "init"; personaId: string; ttsMode?: "gemini" | "supertone" }
+  | { type: "audio_chunk"; data: string }
+  | { type: "force_commit" }
+  | { type: "quiz_answer"; sessionId: string; questionId: string; answerIndex: number };
+
+// ── Server → Client ──────────────────────────────────────
+export type ServerMessage =
+  | { type: "session_ready"; sessionId: string }
+  | { type: "transcript"; text: string }
+  | { type: "ai_text"; text: string }
+  | { type: "ai_audio"; data: string; mimeType: string; done: boolean }
+  | { type: "avatar_state"; state: "idle" | "listening" | "speaking" | "thinking" }
+  | { type: "quiz"; questions: QuizQuestion[] }
+  | { type: "error"; message: string };
+</file>
+
+<file path="src/ws-handler.ts">
+import type WebSocket from "ws";
+import type { Session } from "@google/genai";
+import { v4 as uuidv4 } from "uuid";
+import {
+  createSession,
+  addMessage,
+  getMessages,
+  getUserMessageCount,
+  saveQuiz,
+} from "./db";
+import {
+  createLiveSession,
+  sendAudioChunk,
+  closeLiveSession,
+  sendActivityStart,
+  sendActivityEnd,
+  type LiveCallbacks,
+} from "./gemini";
+import {
+  createTextLiveSession,
+  type TextLiveCallbacks,
+} from "./gemini-text";
+import { supertoneTextToSpeech } from "./supertone";
+import { QUIZ } from "./config";
+import { EventEngine } from "./events/engine";
+import { QuizRuleTrigger } from "./events/quiz-rule";
+// import { QuizAgentTrigger } from "./events/quiz-agent";
+import type { MCEvent } from "./events/types";
+import type { ClientMessage, ServerMessage } from "./types";
+
+function send(ws: WebSocket, msg: ServerMessage): void {
+  if (ws.readyState === 1 /* OPEN */) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+
+// ── 이벤트 엔진 ───────────────────────────────────────────────────
+const eventEngine = new EventEngine()
+  .register(new QuizRuleTrigger());
+// .register(new QuizAgentTrigger({ minGap: 3 }))
+
+// ── PCM-16 RMS 계산 (auto VAD 대체용) ─────────────────────
+// base64 인코딩된 Int16 PCM 데이터의 RMS 에너지를 반환합니다.
+// 클라이언트 ENERGY_THRESHOLD(0.012 normalized) 기준 → Int16 ≈ 400
+const SPEECH_THRESHOLD = 400;
+const SILENCE_TIMEOUT_MS = 600;
+
+function calcPCMRMS(base64PCM: string): number {
+  const buf = Buffer.from(base64PCM, "base64");
+  const count = Math.floor(buf.length / 2);
+  if (count === 0) return 0;
+  let sum = 0;
+  for (let i = 0; i < count; i++) {
+    const s = buf.readInt16LE(i * 2);
+    sum += s * s;
+  }
+  return Math.sqrt(sum / count);
+}
+
+export function handleConnection(ws: WebSocket): void {
+  let sessionId: string | null = null;
+  let personaId = "oracle";
+  let ttsMode: "gemini" | "supertone" = "gemini";
+  let geminiSession: Session | null = null;
+
+  // Gemini inputAudioTranscription으로 받은 사용자 발화 텍스트
+  let currentUserTranscript = "";
+
+  // ── Manual VAD 상태 ────────────────────────────────────
+  // auto VAD 비활성화 후 activityStart/End를 직접 관리합니다.
+  let isActivityActive = false;
+  let silenceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  console.log("[WS] Client connected");
+
+  // ── Gemini Live (AUDIO mode) callbacks ───────────────────────
+  const liveCallbacks: LiveCallbacks = {
+    onTranscript: (text) => {
+      currentUserTranscript = text;
+      console.log(`[WS] User transcript: "${text}"`);
+      send(ws, { type: "transcript", text });
+      send(ws, { type: "avatar_state", state: "thinking" });
+    },
+
+    onAudioChunk: async (base64, mimeType, done) => {
+      if (!done) {
+        send(ws, { type: "ai_audio", data: base64, mimeType, done: false });
+        send(ws, { type: "avatar_state", state: "speaking" });
+      } else {
+        send(ws, { type: "ai_audio", data: "", mimeType, done: true });
+        send(ws, { type: "avatar_state", state: "listening" });
+        await saveTurnAndDispatchEvents("[audio]");
+        currentUserTranscript = "";
+        // Gemini 응답 완료 → 다음 발화를 위해 activity 상태 초기화
+        isActivityActive = false;
+        if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+      }
+    },
+
+    onError: (err) => {
+      console.error("[Gemini Live] Error:", err.message);
+      send(ws, { type: "error", message: "Gemini Live session error" });
+      send(ws, { type: "avatar_state", state: "idle" });
+    },
+
+    onClose: () => {
+      console.log("[Gemini Live] Session closed");
+      geminiSession = null;
+    },
+  };
+
+  // ── Gemini Live (TEXT mode) + Supertone callbacks ─────────────
+  const textLiveCallbacks: TextLiveCallbacks = {
+    onTranscript: (text) => {
+      currentUserTranscript = text;
+      console.log(`[WS] User transcript: "${text}"`);
+      send(ws, { type: "transcript", text });
+      send(ws, { type: "avatar_state", state: "thinking" });
+    },
+
+    onTextResponse: async (text) => {
+      send(ws, { type: "ai_text", text });
+      send(ws, { type: "avatar_state", state: "speaking" });
+
+      try {
+        const audioBuffer = await supertoneTextToSpeech(text);
+        const base64 = audioBuffer.toString("base64");
+        send(ws, { type: "ai_audio", data: base64, mimeType: "audio/mpeg", done: false });
+        send(ws, { type: "ai_audio", data: "", mimeType: "audio/mpeg", done: true });
+      } catch (err) {
+        console.error("[Supertone] TTS failed:", err);
+        send(ws, { type: "error", message: "Supertone TTS failed" });
+      }
+
+      send(ws, { type: "avatar_state", state: "listening" });
+      await saveTurnAndDispatchEvents(text);
+      currentUserTranscript = "";
+    },
+
+    onError: (err) => {
+      console.error("[Gemini Text Live] Error:", err.message);
+      send(ws, { type: "error", message: "Gemini Text Live session error" });
+      send(ws, { type: "avatar_state", state: "idle" });
+    },
+
+    onClose: () => {
+      console.log("[Gemini Text Live] Session closed");
+      geminiSession = null;
+    },
+  };
+
+  // ── 턴 완료: DB 저장(STT 전사 텍스트) + 이벤트 엔진 ──────────────
+  // currentUserTranscript 는 Gemini inputAudioTranscription 결과물.
+  // DB에 사용자 발화 텍스트를 저장하므로 퀴즈 생성 등 컨텍스트로 활용됩니다.
+  async function saveTurnAndDispatchEvents(aiMessage: string) {
+    if (!sessionId || !currentUserTranscript) return;
+
+    addMessage(sessionId, "user", currentUserTranscript);
+    addMessage(sessionId, "assistant", aiMessage);
+    console.log(`[WS] Turn saved — user: "${currentUserTranscript.slice(0, 60)}"`);
+
+    const messageCount = getUserMessageCount(sessionId);
+    const history = getMessages(sessionId, QUIZ.HISTORY_WINDOW);
+
+    const events = await eventEngine.processTurn({
+      sessionId,
+      userMessage: currentUserTranscript,
+      aiMessage,
+      messageCount,
+      history,
+    });
+
+    for (const event of events) {
+      await dispatchEvent(event);
+    }
+  }
+
+  async function dispatchEvent(event: MCEvent) {
+    switch (event.type) {
+      case "quiz": {
+        const { payload: questions } = event;
+        saveQuiz(sessionId!, questions);
+        send(ws, { type: "quiz", questions });
+        console.log(`[WS] Quiz dispatched: ${questions.length} question(s)`);
+        break;
+      }
+    }
+  }
+
+  // ── WebSocket message handler ─────────────────────────────────
+  ws.on("message", async (raw) => {
+    let msg: ClientMessage;
+    try {
+      msg = JSON.parse(raw.toString()) as ClientMessage;
+    } catch {
+      send(ws, { type: "error", message: "Invalid JSON payload" });
+      return;
+    }
+
+    switch (msg.type) {
+      case "init": {
+        if (geminiSession) {
+          closeLiveSession(geminiSession);
+          geminiSession = null;
+        }
+
+        sessionId = uuidv4();
+        personaId = msg.personaId ?? "oracle";
+        ttsMode = msg.ttsMode ?? "gemini";
+        createSession(sessionId, personaId);
+
+        console.log(`[WS] Session starting: ${sessionId} (${personaId}) mode=${ttsMode}`);
+
+        try {
+          if (ttsMode === "supertone") {
+            geminiSession = await createTextLiveSession(personaId, textLiveCallbacks);
+          } else {
+            geminiSession = await createLiveSession(personaId, liveCallbacks);
+          }
+
+          send(ws, { type: "session_ready", sessionId });
+          send(ws, { type: "avatar_state", state: "listening" });
+          console.log(`[WS] Session ready: ${sessionId}`);
+        } catch (err) {
+          console.error("[WS] Failed to create Gemini session:", err);
+          send(ws, { type: "error", message: "Failed to connect to Gemini Live" });
+        }
+        break;
+      }
+
+      case "audio_chunk": {
+        if (!geminiSession) return;
+
+        const energy = calcPCMRMS(msg.data);
+
+        if (energy > SPEECH_THRESHOLD) {
+          // 발화 감지: 침묵 타이머 리셋
+          if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+
+          // 새 발화 시작 시 activityStart 전송
+          if (!isActivityActive) {
+            sendActivityStart(geminiSession);
+            isActivityActive = true;
+          }
+
+          // 침묵 감지 타이머 설정 (600ms 무음 → activityEnd)
+          silenceTimer = setTimeout(() => {
+            silenceTimer = null;
+            if (geminiSession && isActivityActive) {
+              sendActivityEnd(geminiSession);
+              isActivityActive = false;
+            }
+          }, SILENCE_TIMEOUT_MS);
+        }
+
+        // activity 활성 구간의 오디오만 전송
+        if (isActivityActive) {
+          sendAudioChunk(geminiSession, msg.data);
+        }
+        break;
+      }
+
+      case "force_commit": {
+        if (!geminiSession) return;
+        // 침묵 타이머 취소 후 즉시 activityEnd (발화 중일 때만)
+        if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+        if (isActivityActive) {
+          sendActivityEnd(geminiSession);
+          isActivityActive = false;
+        }
+        send(ws, { type: "avatar_state", state: "thinking" });
+        break;
+      }
+
+      case "quiz_answer": {
+        console.log(`[WS] Quiz answer — q:${msg.questionId} idx:${msg.answerIndex}`);
+        break;
+      }
+
+      default: {
+        send(ws, { type: "error", message: `Unknown message type` });
+      }
+    }
+  });
+
+  ws.on("close", () => {
+    console.log(`[WS] Disconnected (session: ${sessionId ?? "none"})`);
+    if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+    if (geminiSession) {
+      closeLiveSession(geminiSession);
+      geminiSession = null;
+    }
+  });
+
+  ws.on("error", (err) => {
+    console.error("[WS] Socket error:", err);
+  });
+}
+</file>
+
+<file path="tsconfig.json">
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    "strict": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
+}
+</file>
+
+<file path=".env.example">
+GEMINI_API_KEY=your_gemini_api_key_here
+# LangSmith (optional - for tracing/debugging)
+# LANGCHAIN_TRACING_V2=true
+# LANGCHAIN_API_KEY=your_langsmith_api_key_here
+# LANGCHAIN_PROJECT=AiCupid-backend
+SUPERTONE_API_KEY=your_supertone_api_key_here
+SUPERTONE_VOICE_ID=your_supertone_voice_id_here
+PORT=8080
+FRONTEND_ORIGIN=http://localhost:3000
+</file>
+
+<file path="main.py">
+import json
+import base64
+from datetime import datetime
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
+from uuid import uuid4
+
+from services.agent import get_app_runnable
+from services.voice import speech_to_text_gemini, text_to_speech_google
+
+app = FastAPI()
+
+@app.get("/")
+def read_root():
+    return {"Hello": "LangGraph Quiz", "docs": "http://localhost:8000/docs"}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "AiCupid-backend"}
+
+@app.get("/api/hello")
+async def hello(name: str = "Guest"):
+    return {"message": f"Hello, {name}!", "timestamp": datetime.now().isoformat()}
+
+@app.post("/invoke")
+async def invoke(data: dict):
+    try:
+        runnable = get_app_runnable()
+    except Exception as e:
+        return JSONResponse(
+            status_code=503,
+            content={"error": f"퀴즈 엔진 초기화 실패: {e}"},
+        )
+
+    user_input = data.get("input")
+    if not user_input:
+        return JSONResponse(status_code=400, content={"error": "Input message is required"})
+
+    current_state = data.get("state", {"messages": [], "question_id": 0, "score": 0})
+    current_state["messages"] = current_state.get("messages", []) + [("user", user_input)]
+
+    result = runnable.invoke(current_state)
+    last_ai_message = ""
+    for role, msg in reversed(result["messages"]):
+        if role == "ai":
+            last_ai_message = msg
+            break
+    return {"response": last_ai_message, "state": result}
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    
+    session_id = websocket.query_params.get("session_id", str(uuid4()))
+    config = {"configurable": {"thread_id": session_id}}
+
+    runnable = get_app_runnable()
+    audio_chunks = []
+
+    try:
+        while True:
+            message = await websocket.receive()
+            if "bytes" in message:
+                audio_chunks.append(message["bytes"])
+            elif "text" in message:
+                data = json.loads(message["text"])
+                
+                if data.get("type") == "speech_end" and audio_chunks:
+                    sample_rate = int(data.get("sample_rate", 16000))
+                    raw_pcm = b"".join(audio_chunks)
+                    audio_chunks = [] # 청크 초기화
+                    
+                    # 1. STT
+                    transcript = await speech_to_text_gemini(raw_pcm, sample_rate)
+                    await websocket.send_json({"type": "final_transcript", "text": transcript})
+
+                    # 2. Agent 호출 (LangGraph)
+                    # 메시지가 비어있을 경우를 대비한 안전한 호출
+                    result = runnable.invoke({"messages": [("user", transcript)]}, config=config)
+                    
+                    # 3. AI 답변 추출 (안전한 방식)
+                    ai_text = ""
+                    for role, msg in reversed(result["messages"]):
+                        if role == "ai":
+                            ai_text = msg.content if hasattr(msg, 'content') else str(msg)
+                            break
+                    
+                    if not ai_text: ai_text = "죄송해요, 이해하지 못했어요."
+                    
+                    await websocket.send_json({"type": "ai_response_text", "text": ai_text})
+
+                    # 4. TTS (OpenAI TTS)
+                    audio_content = await text_to_speech_openai(ai_text) 
+
+                    # 중복되는 send_bytes는 삭제하고, JSON 규격에만 맞춰서 보냅니다.
+                    await websocket.send_json({
+                        "type": "audio",
+                        "data": base64.b64encode(audio_content).decode("utf-8"),
+                        "mime_type": "audio/wav" # 문규격에 맞춰 wav로 명시
+                    })
+    except WebSocketDisconnect:
+        print(f"Client disconnected: {session_id}")
+    except Exception as e:
+        print(f"Error: {e}")
+        await websocket.send_json({"type": "error", "message": str(e)})
+</file>
+
+<file path="requirements.txt">
+fastapi
+langchain
+langchain-core
+langchain-google-genai
+langgraph
+langsmith
+pydantic
+python-dotenv
+uvicorn
+langgraph-checkpoint-sqlite
+gTTS
+</file>
+
+</files>
