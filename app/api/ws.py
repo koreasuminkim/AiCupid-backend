@@ -3,7 +3,7 @@ import base64
 from uuid import uuid4
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from services.voice import speech_to_text_gemini, text_to_speech_openai
-from ai_agent.graph import get_compiled_graph
+from services.agent import get_app_runnable
 from live_bridge import run_live_session
 
 router = APIRouter(prefix="/ws", tags=["websocket"])
@@ -13,7 +13,7 @@ async def websocket_quiz_endpoint(websocket: WebSocket):
     await websocket.accept()
     session_id = websocket.query_params.get("session_id", str(uuid4()))
     config = {"configurable": {"thread_id": session_id}}
-    runnable = get_compiled_graph()
+    runnable = get_app_runnable() 
     audio_chunks = []
 
     try:
@@ -45,7 +45,7 @@ async def websocket_quiz_endpoint(websocket: WebSocket):
                     })
     except WebSocketDisconnect:
         print(f"Disconnected: {session_id}")
-        
+
 @router.websocket("/live")
 async def websocket_live_endpoint(websocket: WebSocket):
     await websocket.accept()
