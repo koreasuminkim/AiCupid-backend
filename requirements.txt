@@ -35,3 +35,4 @@ boto3
 passlib[bcrypt]
 python-jose[cryptography]
 python-multipart
+email-validator
