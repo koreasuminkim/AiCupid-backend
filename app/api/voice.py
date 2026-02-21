@@ -4,7 +4,7 @@ import os
 import wave
 from typing import Annotated
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from ai_agent.prompts import AI_MC_SYSTEM_PROMPT
 
@@ -108,9 +108,13 @@ def _gemini_audio_to_reply(audio_bytes: bytes, mime_type: str) -> str:
 @router.post("/audio-to-text")
 async def audio_to_text(
     file: Annotated[UploadFile, File(description="음성 파일 (wav, mp3 등)")],
+    user_id_1: Annotated[int, Form(description="참가 유저 ID 1")],
+    user_id_2: Annotated[int, Form(description="참가 유저 ID 2")],
+    session_id: Annotated[str, Form(description="세션 ID")],
 ):
     """
     음성 파일 업로드 → Gemini 멀티모달(MC 답변 텍스트) → Gemini TTS(음성 변환).
+    Form: user_id_1, user_id_2, session_id 필수.
     응답: reply(텍스트), system_instruction, audio(base64 WAV), mime_type.
     """
     mime_type = (file.content_type or "audio/wav").strip().lower()

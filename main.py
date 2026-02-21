@@ -26,13 +26,26 @@ API 문서입니다.
 """,
 )
 
-# CORS
+# CORS (allow_credentials=True 일 때는 allow_origins에 "*" 불가 → 구체적 origin 사용)
+_frontend_origin = os.environ.get("FRONTEND_ORIGIN", "http://localhost:3000").strip()
+_cors_origins = [
+    _frontend_origin,
+    "https://aicupid-frontend.vercel.app",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",   # Vite 기본
+    "http://127.0.0.1:5173",
+]
+# 중복 제거, 빈 문자열 제거
+_cors_origins = list(dict.fromkeys(o for o in _cors_origins if o))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # 일단 모두 허용
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # 라우터 등록
