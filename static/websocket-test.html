@@ -32,6 +32,7 @@
     <select id="endpoint">
       <option value="/ws/quiz-text">/ws/quiz-text — 퀴즈 로직 테스트 (텍스트 주고받기)</option>
       <option value="/ws/live">/ws/live — Gemini Live API (음성 스트리밍)</option>
+      <option value="/ws/live/mc">/ws/live/mc — Live API + 대화 맥락 (roles: ai/mc, 어색한 대화 풀기)</option>
       <option value="/ws/audio">/ws/audio — STT + 퀴즈 + TTS</option>
     </select>
     <div class="hint" id="hint">ws/quiz-text: JSON {"text":"퀴즈 시작"} 전송 → 퀴즈 그래프 실행 후 응답 수신 (로직 테스트용)</div>
@@ -68,6 +69,7 @@
     const hints = {
       '/ws/quiz-text': 'ws/quiz-text: JSON {"text":"퀴즈 시작"} 전송 → 퀴즈 그래프 실행 후 응답 수신 (로직 테스트용)',
       '/ws/live': 'ws/live: 프론트에서 PCM 16kHz 청크(binary 또는 JSON {"audio":"base64"}) 전송 → 오디오/텍스트 수신',
+      '/ws/live/mc': 'ws/live/mc: 첫 메시지로 대화 내역(바이트 또는 JSON type:conversation_history) 전송 후, PCM 오디오 청크 전송 → Live API (roles: ai/mc, 어색한 대화 풀기)',
       '/ws/audio': 'ws/audio: 바이너리 음성 스트림 전송 → STT → 퀴즈 → TTS 오디오 수신'
     };
 

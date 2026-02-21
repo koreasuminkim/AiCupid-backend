@@ -2,7 +2,7 @@
 Gemini Live API WebSocket 브리지.
 프론트에서 받은 음성 청크를 Live API로 전달하고, 응답 오디오/텍스트를 프론트로 전달.
 
-- 입력: 16-bit PCM, 16kHz, mono (프론트에서 끊어서 전송)
+- 입력: 16-bit PCM 16kHz mono, 또는 WAV(헤더 제거 후 PCM으로 전달)
 - 출력: 24kHz 오디오 (Live API 기본)
 - 참고: https://ai.google.dev/gemini-api/docs/live
 """
@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import os
+import wave
 
 # GEMINI_API_KEY는 .env에서 로드된 상태여야 함
 
@@ -24,6 +26,19 @@ LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
 DEFAULT_SYSTEM_INSTRUCTION = """당신은 AiCupid 퀴즈·대화 에이전트입니다.
 사용자와 퀴즈를 진행하거나, 퀴즈와 무관한 대화를 할 수 있습니다.
 답변은 친근하고 짧게, 한국어로 해 주세요. 음성으로 자연스럽게 답해 주세요."""
+
+
+def ensure_pcm_16k(raw: bytes) -> bytes:
+    """WAV면 헤더 제거해 PCM만 반환, 아니면 그대로 (Live API: 16bit PCM 16kHz)."""
+    if len(raw) < 44 or raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
+        return raw
+    try:
+        with io.BytesIO(raw) as bio:
+            with wave.open(bio, "rb") as w:
+                frames = w.readframes(w.getnframes())
+            return frames
+    except Exception:
+        return raw
 
 
 def get_system_instruction_from_langchain() -> str:
@@ -117,13 +132,17 @@ async def run_live_session(websocket, system_instruction: str | None = None, use
                 if raw.get("type") == "websocket.disconnect":
                     break
                 if "bytes" in raw and raw["bytes"]:
-                    await audio_queue_to_live.put(bytes(raw["bytes"]))
+                    pcm = ensure_pcm_16k(bytes(raw["bytes"]))
+                    if pcm:
+                        await audio_queue_to_live.put(pcm)
                 elif "text" in raw:
                     try:
                         obj = json.loads(raw["text"])
                         if "audio" in obj:
                             chunk = base64.b64decode(obj["audio"])
-                            await audio_queue_to_live.put(chunk)
+                            pcm = ensure_pcm_16k(chunk)
+                            if pcm:
+                                await audio_queue_to_live.put(pcm)
                     except (json.JSONDecodeError, KeyError):
                         pass
             await audio_queue_to_live.put(None)
