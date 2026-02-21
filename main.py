@@ -1,277 +1,164 @@
-import os
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from langgraph.graph import StateGraph, END
-from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
-from typing import TypedDict, Annotated, List
-import operator
-import json
 
-from quiz_chain import QuizGrader, QuestionProvider, quiz_data, get_react_chain
-
-# .env 파일에서 환경 변수 로드
 load_dotenv()
 
-# --- LangGraph 상태 정의 ---
-class AgentState(TypedDict):
-    messages: Annotated[list, operator.add]
-    question_id: int
-    score: int
-    next_action: str  # "grade", "ask", "chat", "finish"
+import os
+import json
+import base64
+import uuid
+from uuid import uuid4
 
-# --- LLM 및 도구 초기화 ---
-llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0)
-react_chain = get_react_chain()
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 
-# --- LangGraph 노드 함수 정의 ---
+from services.voice import speech_to_text_gemini, text_to_speech_openai
+from ai_agent.graph import get_compiled_graph
+from typing import Annotated
 
-# 1. 라우터 노드: 다음에 수행할 작업을 결정
-def router_node(state: AgentState):
-    """사용자 입력과 현재 상태를 기반으로 다음 행동을 결정합니다."""
-    last_message = state["messages"][-1]
-    
-    # react_chain을 호출하여 LLM이 다음 행동을 결정하도록 함
-    # 실제로는 LLM이 JSON 형식의 도구 호출을 반환하도록 유도해야 함
-    # 여기서는 개념을 단순화하여 규칙 기반으로 처리
-    
-    action = "chat" # 기본값
-    if state["question_id"] < len(quiz_data):
-        # 퀴즈가 진행 중일 때
-        # 사용자가 답변을 한 것인지, 아니면 다른 말을 한 것인지 판단 필요
-        # 여기서는 일단 질문 다음엔 무조건 채점한다고 가정
-        if len(state["messages"]) > 1 and state["messages"][-2][0] == 'ai' and "질문" in state["messages"][-2][1]:
-             action = "grade"
-        else:
-             action = "ask"
-    else:
-        action = "finish"
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 
-    if "퀴즈" in last_message[1] and "시작" in last_message[1]:
-        action = "ask"
+from audio_to_text_graph import build_audio_to_text_graph
 
-    print(f"Router decided action: {action}")
-    return {"next_action": action}
-
-# 2. 답변 채점 노드
-def grade_answer_node(state: AgentState):
-    """사용자의 답변을 채점하고 점수를 업데이트합니다."""
-    user_message = state["messages"][-1]
-    user_answer = user_message[1]
-    q_id = state["question_id"]
-
-    grader = QuizGrader(user_answer=user_answer, question_id=q_id)
-    is_correct = grader.grade()
-    
-    new_score = state["score"]
-    response_message = ""
-    if is_correct:
-        new_score += 1
-        response_message = f"정답입니다! 현재 점수: {new_score}"
-    else:
-        correct_answer = quiz_data[q_id]["answer"]
-        response_message = f"아쉽네요. 정답은 '{correct_answer}'입니다. 현재 점수: {new_score}"
-        
-    # 다음 질문으로 넘어가기 위해 question_id 증가
-    next_q_id = q_id + 1
-    
-    return {
-        "messages": [("ai", response_message)],
-        "score": new_score,
-        "question_id": next_q_id
-    }
-
-# 3. 질문 출제 노드
-def ask_question_node(state: AgentState):
-    """다음 퀴즈 질문을 제공합니다."""
-    q_id = state["question_id"]
-    provider = QuestionProvider(question_id=q_id)
-    question = provider.get_question()
-    
-    message = f"퀴즈 질문입니다: {question}" if q_id < len(quiz_data) else question
-    
-    return {"messages": [("ai", message)]}
-
-# 4. 일반 대화 노드
-def chat_node(state: AgentState):
-    """퀴즈와 관련 없는 일반 대화를 처리합니다."""
-    response = llm.invoke(state['messages'])
-    return {"messages": [response]}
-
-# --- LangGraph 워크플로우 정의 ---
-workflow = StateGraph(AgentState)
-
-workflow.add_node("router", router_node)
-workflow.add_node("grade_answer", grade_answer_node)
-workflow.add_node("ask_question", ask_question_node)
-workflow.add_node("chat", chat_node)
-
-workflow.set_entry_point("router")
-
-# 조건부 엣지 설정
-def decide_next_step(state: AgentState):
-    return state["next_action"]
-
-workflow.add_conditional_edges(
-    "router",
-    decide_next_step,
-    {
-        "grade": "grade_answer",
-        "ask": "ask_question",
-        "chat": "chat",
-        "finish": END,
-    },
+app = FastAPI(
+    title="AiCupid Backend API",
+    description="음성 파일을 텍스트로 변환하는 API (Gemini + LangGraph).",
 )
-
-# 각 행동 후에는 다시 라우터로 돌아가 다음 행동을 결정
-workflow.add_edge("grade_answer", "router")
-workflow.add_edge("ask_question", "router")
-workflow.add_edge("chat", "router")
-
-
-# 그래프 컴파일
-app_runnable = workflow.compile()
-
-# FastAPI 앱 생성
-app = FastAPI()
-
-@app.post("/invoke")
-async def invoke(data: dict):
-    """
-    LangGraph 퀴즈 체인을 호출합니다.
-    Request Body:
-    {
-        "input": "Your message here",
-        "state": {
-            "messages": [("user", "퀴즈 시작")],
-            "question_id": 0,
-            "score": 0
-        }
-    }
-    """
-    user_input = data.get("input")
-    if not user_input:
-        return {"error": "Input message is required"}, 400
-    
-    current_state = data.get("state", {"messages": [], "question_id": 0, "score": 0})
-    current_state["messages"] = current_state.get("messages", []) + [("user", user_input)]
-
-    # LangGraph 실행
-    result = app_runnable.invoke(current_state)
-    
-    # 마지막 AI 메시지만 추출하여 응답
-    last_ai_message = ""
-    for role, msg in reversed(result['messages']):
-        if role == 'ai':
-            last_ai_message = msg
-            break
-            
-    return {"response": last_ai_message, "state": result}
-
-
-# ... (기존 import 구문들) ...
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from google.cloud import speech
-from elevenlabs.client import ElevenLabs
-from elevenlabs import stream as elevenlabs_stream
-
-# ... (기존 LangGraph 및 FastAPI 앱 설정 코드) ...
-
-# --- ElevenLabs 및 Google STT 클라이언트 초기화 ---
-elevenlabs_client = ElevenLabs(api_key=os.environ.get("ELEVENLABS_API_KEY"))
-speech_client = speech.SpeechClient()
-
-# --- WebSocket을 통한 실시간 음성 처리 ---
-
-@app.websocket("/ws/audio")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    
-    # Google STT 스트리밍 설정
-    streaming_config = speech.StreamingRecognitionConfig(
-        config=speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=16000,
-            language_code="ko-KR",
-        ),
-        interim_results=True,
-    )
-
-    try:
-        # LangGraph 상태 초기화
-        graph_state = {"messages": [], "question_id": 0, "score": 0}
-
-        while True:
-            # 1. 클라이언트로부터 음성 데이터 수신 및 STT 처리
-            stt_requests = (
-                speech.StreamingRecognizeRequest(audio_content=chunk)
-                async for chunk in websocket.iter_bytes()
-            )
-            
-            # Google STT API로 스트리밍 요청
-            stt_responses = speech_client.streaming_recognize(
-                config=streaming_config, requests=stt_requests
-            )
-
-            transcript = ""
-            for response in stt_responses:
-                if not response.results:
-                    continue
-                
-                result = response.results[0]
-                if not result.alternatives:
-                    continue
-
-                # 중간 결과는 클라이언트로 보내 실시간 자막처럼 보여줄 수 있음
-                if not result.is_final:
-                    await websocket.send_json({"type": "interim_transcript", "text": result.alternatives[0].transcript})
-                else:
-                    # 최종 결과가 나오면 전체 문장을 구성
-                    transcript = result.alternatives[0].transcript
-                    await websocket.send_json({"type": "final_transcript", "text": transcript})
-                    break # 한 문장이 완성되면 STT 스트림 중지
-
-            if not transcript:
-                continue
-
-            # 2. STT 변환 텍스트로 LangGraph 체인 호출
-            graph_state["messages"] = graph_state.get("messages", []) + [("user", transcript)]
-            graph_result = app_runnable.invoke(graph_state)
-            graph_state = graph_result # 다음 요청을 위해 상태 업데이트
-
-            # LangGraph의 마지막 AI 응답 추출
-            ai_response_text = ""
-            for role, msg in reversed(graph_result['messages']):
-                if role == 'ai':
-                    ai_response_text = msg
-                    break
-            
-            if not ai_response_text:
-                continue
-
-            await websocket.send_json({"type": "ai_response_text", "text": ai_response_text})
-
-            # 3. LLM 응답 텍스트를 ElevenLabs TTS로 스트리밍하여 클라이언트로 전송
-            audio_stream = elevenlabs_client.generate(
-                text=ai_response_text,
-                model="eleven_multilingual_v2", # 한국어 지원 모델
-                stream=True
-            )
-            
-            # 오디오 청크를 클라이언트로 스트리밍
-            for chunk in elevenlabs_stream(audio_stream):
-                await websocket.send_bytes(chunk)
-            
-            # 스트리밍 종료를 알리는 메시지
-            await websocket.send_json({"type": "audio_stream_end"})
-
-
-    except WebSocketDisconnect:
-        print("Client disconnected")
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        await websocket.close(code=1011, reason=str(e))
 
 
 @app.get("/")
 def read_root():
-    return {"Hello": "LangGraph Quiz"}
+    return {"service": "AiCupid-backend", "docs": "/docs"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "AiCupid-backend"}
+
+
+# --- 음성 → 텍스트 (LangGraph + Gemini) ---
+
+_AUDIO_TO_TEXT_RUNNABLE = None
+
+
+def _get_audio_to_text_runnable():
+    global _AUDIO_TO_TEXT_RUNNABLE
+    if _AUDIO_TO_TEXT_RUNNABLE is None:
+        _AUDIO_TO_TEXT_RUNNABLE = build_audio_to_text_graph().compile()
+    return _AUDIO_TO_TEXT_RUNNABLE
+
+
+# 업로드 허용 MIME (Gemini 지원 형식)
+AUDIO_MIME_TYPES = {
+    "audio/wav",
+    "audio/wave",
+    "audio/x-wav",
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/ogg",
+    "audio/webm",
+    "audio/flac",
+    "audio/mp4",
+}
+
+
+@app.post("/api/audio-to-text")
+async def audio_to_text(
+    file: Annotated[UploadFile, File(description="음성 파일 (wav, mp3, ogg, webm, flac 등)")],
+):
+    """
+    음성 파일을 업로드하면 Gemini로 텍스트로 변환해 반환합니다.
+    LangGraph로 변환 파이프라인을 구성합니다.
+    """
+    if not file.content_type or file.content_type.lower() not in AUDIO_MIME_TYPES:
+        # content_type이 비어 있거나 목록에 없으면 파일 확장자로 추정
+        name = (file.filename or "").lower()
+        if not any(name.endswith(ext) for ext in (".wav", ".mp3", ".ogg", ".webm", ".flac", ".m4a", ".mp4")):
+            raise HTTPException(
+                status_code=400,
+                detail=f"지원 형식: {', '.join(sorted(AUDIO_MIME_TYPES))}. filename 또는 Content-Type 필요.",
+            )
+        mime_type = "audio/wav"
+        if name.endswith(".mp3") or name.endswith(".mpeg"):
+            mime_type = "audio/mpeg"
+        elif name.endswith(".ogg"):
+            mime_type = "audio/ogg"
+        elif name.endswith(".webm"):
+            mime_type = "audio/webm"
+        elif name.endswith(".flac"):
+            mime_type = "audio/flac"
+        elif name.endswith(".mp4") or name.endswith(".m4a"):
+            mime_type = "audio/mp4"
+    else:
+        mime_type = file.content_type.lower()
+
+    try:
+        audio_bytes = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"파일 읽기 실패: {e}")
+
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="빈 파일입니다.")
+
+    try:
+        runnable = _get_audio_to_text_runnable()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"엔진 초기화 실패 (GEMINI_API_KEY 확인): {e}")
+
+    state = {
+        "audio_bytes": audio_bytes,
+        "mime_type": mime_type,
+        "text": "",
+        "error": "",
+    }
+    result = runnable.invoke(state)
+
+    if result.get("error"):
+        raise HTTPException(status_code=502, detail=result["error"])
+
+    return {"text": result.get("text", "")}
+
+
+@app.websocket("/ws/quiz") # 사용자님 전용 엔드포인트 분리
+async def websocket_quiz_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    
+    session_id = websocket.query_params.get("session_id", str(uuid4()))
+    config = {"configurable": {"thread_id": session_id}} # 세션 유지
+    
+    runnable = get_compiled_graph()
+    audio_chunks = []
+
+    try:
+        while True:
+            message = await websocket.receive()
+            if "bytes" in message:
+                audio_chunks.append(message["bytes"])
+            elif "text" in message:
+                data = json.loads(message["text"])
+                
+                # 'speech_end' 신호 시 사용자님만의 STT -> Agent -> TTS 루프 실행
+                if data.get("type") == "speech_end" and audio_chunks:
+                    raw_pcm = b"".join(audio_chunks)
+                    audio_chunks = []
+                    
+                    # 1. STT (사용자 기능)
+                    transcript = await speech_to_text_gemini(raw_pcm)
+                    await websocket.send_json({"type": "final_transcript", "text": transcript})
+
+                    # 2. Agent (사용자 기능 + 기반 구조)
+                    result = await runnable.ainvoke({"messages": [("user", transcript)]}, config=config)
+                    
+                    # 3. AI 답변 추출
+                    ai_text = result["messages"][-1][1] if result["messages"] else "죄송해요."
+                    await websocket.send_json({"type": "ai_response_text", "text": ai_text})
+
+                    # 4. OpenAI TTS (사용자 기능)
+                    audio_content = await text_to_speech_openai(ai_text)
+                    await websocket.send_json({
+                        "type": "audio",
+                        "data": base64.b64encode(audio_content).decode("utf-8"),
+                        "mime_type": "audio/wav"
+                    })
+    except WebSocketDisconnect:
+        print(f"Disconnected: {session_id}")

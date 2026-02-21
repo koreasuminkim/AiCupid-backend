@@ -1,0 +1,8 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "audio_to_text": "./audio_to_text_graph.py:agent",
+    "aicupid_quiz": "./src/agent.py:agent"
+  },
+  "env": ".env"
+}
