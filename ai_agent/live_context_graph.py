@@ -27,6 +27,18 @@ def start_balance_game() -> str:
     return ""
 
 
+@tool
+def start_psych_test() -> str:
+    """참가자가 심리 테스트를 하자고 하거나, MC가 심리 테스트를 제안·시작할 때 호출하세요."""
+    return ""
+
+
+@tool
+def start_four_choice_quiz() -> str:
+    """참가자가 4지선다 퀴즈를 하자고 하거나, MC가 4지선다 퀴즈를 제안·시작할 때 호출하세요."""
+    return ""
+
+
 class LiveContextState(TypedDict, total=False):
     """대화 바이트 → Live용 시스템 지시문 상태."""
 
@@ -35,7 +47,9 @@ class LiveContextState(TypedDict, total=False):
     conversation: list[tuple[str, str]]  # (role, content)
     system_instruction: str
     reply: str  # MC가 할 답변(새 질문/말) — Studio 등에서 출력용
-    triggered_balance_game_questions: list[tuple[str, str, str]]  # (question_text, option_a, option_b) 3개, 에이전트가 게임 트리거 시
+    triggered_balance_game_questions: list[tuple[str, str, str]]  # (question_text, option_a, option_b) 3개
+    triggered_psych_test: bool  # 에이전트가 심리 테스트 트리거 시
+    triggered_four_choice_quiz: bool  # 에이전트가 4지선다 퀴즈 트리거 시
 
 
 def _parse_conversation_node(state: LiveContextState) -> dict:
@@ -91,7 +105,7 @@ def _build_instruction_node(state: LiveContextState) -> dict:
             f"{context_block}\n\n"
             "위 대화 내역을 기반으로 참가자에게 자연스러운 **새 질문**을 하거나, 대화를 이어가세요. "
             "맥락에 맞는 질문으로 분위기를 이끌어 주세요. "
-            "참가자가 밸런스 게임을 하자고 하면 start_balance_game 도구를 호출하세요."
+            "참가자가 밸런스 게임을 하자고 하면 start_balance_game, 심리 테스트를 하자고 하면 start_psych_test, 4지선다 퀴즈를 하자고 하면 start_four_choice_quiz 도구를 호출하세요."
         )
 
     system_instruction = "\n\n".join(parts)
@@ -112,17 +126,24 @@ def _generate_reply_node(state: LiveContextState) -> dict:
             messages.append(HumanMessage(content=content))
         else:
             messages.append(AIMessage(content=content))
-    messages.append(HumanMessage(content="위 대화 맥락에 맞게, MC로서 참가자에게 할 한 문장(인사·질문·말)만 짧게 답해 주세요. 따옴표나 설명 없이 말만 출력하세요. 단, 밸런스 게임을 시작할 때는 start_balance_game 도구를 먼저 호출한 뒤, 그 결과를 활용해 답하세요."))
+    messages.append(HumanMessage(
+        content="위 대화 맥락에 맞게, MC로서 참가자에게 할 한 문장(인사·질문·말)만 짧게 답해 주세요. "
+        "따옴표나 설명 없이 말만 출력하세요. "
+        "밸런스 게임 시작 시 start_balance_game, 심리 테스트 시 start_psych_test, 4지선다 퀴즈 시 start_four_choice_quiz 도구를 먼저 호출한 뒤 그 결과를 활용해 답하세요."
+    ))
 
     triggered_questions: list[tuple[str, str, str]] | None = None
+    triggered_psych_test = False
+    triggered_four_choice_quiz = False
     try:
-        llm_with_tools = get_llm().bind_tools([start_balance_game])
+        llm_with_tools = get_llm().bind_tools([start_balance_game, start_psych_test, start_four_choice_quiz])
         response = llm_with_tools.invoke(messages)
 
         if getattr(response, "tool_calls", None):
             tool_messages = []
             for tc in response.tool_calls:
-                if tc.get("name") == "start_balance_game":
+                name = tc.get("name")
+                if name == "start_balance_game":
                     context_parts = [f"- {role}: {content}" for role, content in conv]
                     context = "\n".join(context_parts) if context_parts else "(아직 대화 없음)"
                     questions = generate_balance_game_questions(context)
@@ -135,6 +156,12 @@ def _generate_reply_node(state: LiveContextState) -> dict:
                     else:
                         result = "밸런스 게임 질문 생성에 실패했습니다."
                     tool_messages.append(ToolMessage(tool_call_id=tc["id"], content=result))
+                elif name == "start_psych_test":
+                    triggered_psych_test = True
+                    tool_messages.append(ToolMessage(tool_call_id=tc["id"], content="심리 테스트를 시작합니다. 프론트에서 /api/psych-test 를 호출하면 됩니다."))
+                elif name == "start_four_choice_quiz":
+                    triggered_four_choice_quiz = True
+                    tool_messages.append(ToolMessage(tool_call_id=tc["id"], content="4지선다 퀴즈를 시작합니다. 프론트에서 /api/four-choice-quiz 를 호출하면 됩니다."))
             messages.append(response)
             messages.extend(tool_messages)
             response = llm_with_tools.invoke(messages)
@@ -150,6 +177,10 @@ def _generate_reply_node(state: LiveContextState) -> dict:
     out: dict = {"reply": reply}
     if triggered_questions is not None:
         out["triggered_balance_game_questions"] = triggered_questions
+    if triggered_psych_test:
+        out["triggered_psych_test"] = True
+    if triggered_four_choice_quiz:
+        out["triggered_four_choice_quiz"] = True
     return out
 
 

@@ -214,6 +214,10 @@ async def first_conversation(
             "type": "balance_game",
             "questions": _balance_game_questions_to_response(session_id, db, triggered),
         }
+    elif out.get("triggered_psych_test"):
+        payload["triggered_game"] = {"type": "psych_test"}
+    elif out.get("triggered_four_choice_quiz"):
+        payload["triggered_game"] = {"type": "four_choice_quiz"}
     return payload
 
 
@@ -290,6 +294,10 @@ async def continue_conversation(
             "type": "balance_game",
             "questions": _balance_game_questions_to_response(session_id, db, triggered),
         }
+    elif out.get("triggered_psych_test"):
+        payload["triggered_game"] = {"type": "psych_test"}
+    elif out.get("triggered_four_choice_quiz"):
+        payload["triggered_game"] = {"type": "four_choice_quiz"}
     return payload
 
 
