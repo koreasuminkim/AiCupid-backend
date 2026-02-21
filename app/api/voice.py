@@ -642,3 +642,67 @@ async def four_choice_quiz(
     if not results:
         raise HTTPException(status_code=502, detail="퀴즈 생성에 실패했습니다.")
     return {"questions": results}
+
+
+# ----- 퀴즈 O/X 결과: 음성 + 퀴즈 ID + 세션 ID → 정답 여부 판정 -----
+
+
+@router.post("/quiz-result")
+async def quiz_result(
+    file: Annotated[UploadFile, File(description="유저 음성 파일 (선택한 답)")],
+    question_id: Annotated[str, Form(description="퀴즈 ID (four_choice_questions.question_id)")],
+    session_id: Annotated[str, Form(description="세션 ID")],
+    db: Session = Depends(get_db),
+):
+    """
+    유저 음성 파일 + 퀴즈 ID + 세션 ID를 받아, 퀴즈 ID로 질문·정답을 조회하고
+    음성을 전사한 뒤 정답 여부를 판정해 O/X로 반환합니다.
+    """
+    question_id = (question_id or "").strip()
+    session_id = (session_id or "").strip()
+    if not question_id:
+        raise HTTPException(status_code=400, detail="question_id는 필수입니다.")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id는 필수입니다.")
+
+    quiz = (
+        db.query(FourChoiceQuestion)
+        .filter(
+            FourChoiceQuestion.question_id == question_id,
+            FourChoiceQuestion.session_id == session_id,
+        )
+        .first()
+    )
+    if not quiz:
+        raise HTTPException(status_code=404, detail="해당 퀴즈를 찾을 수 없습니다.")
+
+    _, _, user_answer = await _read_audio_and_transcribe(file)
+    user_answer = (user_answer or "").strip()
+    correct_answer = (quiz.correct_answer or "").strip()
+
+    # 정답 여부: 전사 내용이 정답과 의미적으로 일치하면 O (LLM으로 판정)
+    from quiz_chain import get_llm
+
+    is_correct = False
+    if user_answer and correct_answer:
+        judge_prompt = (
+            f"질문: {quiz.question_text}\n"
+            f"정답: {correct_answer}\n"
+            f"참가자가 말한 내용: {user_answer}\n\n"
+            "참가자가 정답을 맞혔으면 O, 틀렸으면 X만 한 글자로 출력하세요. (동의어·줄임말도 정답으로 인정)"
+        )
+        try:
+            response = get_llm().invoke([HumanMessage(content=judge_prompt)])
+            out = (response.content if hasattr(response, "content") else str(response)).strip().upper()
+            is_correct = out.startswith("O") and "X" not in out[:2]
+        except Exception:
+            # 폴백: 포함 여부로 판정
+            is_correct = correct_answer in user_answer or user_answer in correct_answer
+    result = "O" if is_correct else "X"
+
+    return {
+        "result": result,
+        "question_text": quiz.question_text,
+        "correct_answer": correct_answer,
+        "user_answer": user_answer,
+    }
