@@ -103,7 +103,13 @@ def _generate_reply_node(state: LiveContextState) -> dict:
     messages.append(HumanMessage(content="위 대화 맥락에 맞게, MC로서 참가자에게 할 한 문장(인사·질문·말)만 짧게 답해 주세요. 따옴표나 설명 없이 말만 출력하세요."))
     try:
         response = get_llm().invoke(messages)
-        reply = (response.content or "").strip() if hasattr(response, "content") else str(response).strip()
+        if hasattr(response, "content"):
+            content = response.content or ""
+            if isinstance(content, list):
+                content = " ".join(str(item) for item in content)
+            reply = content.strip()
+        else:
+            reply = str(response).strip()
     except Exception:
         reply = ""
     return {"reply": reply}
