@@ -2,8 +2,8 @@ import io
 import wave
 import base64
 from langchain_google_genai import ChatGoogleGenerativeAI
-from google.cloud import texttospeech
-from gtts import gTTS
+# from google.cloud import texttospeech  # 사용 시 google-cloud-texttospeech 설치
+# from gtts import gTTS  # 사용 시: pip install gtts
 import openai
 import io
 

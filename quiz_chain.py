@@ -5,8 +5,17 @@ from langchain_core.output_parsers.json import JsonOutputParser
 from typing import Optional
 import json
 
-# LLM 모델 초기화 (창의적인 질문 생성을 위해 temperature를 약간 높임)
-llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.7)
+# LLM은 첫 사용 시 생성 (GEMINI_API_KEY 없어도 서버 기동 가능)
+_llm = None
+
+
+def get_llm():
+    """LangGraph 등에서 사용할 LLM 싱글톤. 첫 호출 시에만 생성."""
+    global _llm
+    if _llm is None:
+        _llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.7)
+    return _llm
+
 
 # 고정 퀴즈 데이터 (aicupid_quiz 그래프용)
 quiz_data = [
@@ -16,15 +25,10 @@ quiz_data = [
 ]
 
 
-def get_llm():
-    """LangGraph 등에서 사용할 LLM 싱글톤."""
-    return llm
-
-
 def get_react_chain():
     """간단한 ReAct 스타일 체인 (호환용)."""
     prompt = ChatPromptTemplate.from_messages([("user", "{input}")])
-    return prompt | llm
+    return prompt | get_llm()
 
 # --- 퀴즈 진행 및 채점을 위한 도구(Tool) 정의 ---
 
@@ -61,7 +65,7 @@ class QuestionProvider(BaseModel):
         )
         
         # JSON 출력을 위한 체인 구성
-        chain = prompt | llm | JsonOutputParser()
+        chain = prompt | get_llm() | JsonOutputParser()
         
         # LLM이 유효한 JSON을 생성할 때까지 몇 번 재시도
         for _ in range(3):
@@ -104,7 +108,7 @@ class QuizGrader(BaseModel):
                 ),
             ]
         )
-        chain = prompt | llm
+        chain = prompt | get_llm()
         response = chain.invoke({
             "question": self.question,
             "correct_answer": self.correct_answer,
