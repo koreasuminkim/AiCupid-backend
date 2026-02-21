@@ -116,3 +116,9 @@ class MatchableUserResponse(BaseModel):
 class MatchableUserListResponse(BaseModel):
     users: List[MatchableUserResponse]
     total_count: int
+
+class CompatibilityResponse(BaseModel):
+    mbti_compatibility: str
+    interest_overlap: str
+    success_probability: int
+    summary: str
