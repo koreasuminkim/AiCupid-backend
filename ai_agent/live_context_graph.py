@@ -8,7 +8,10 @@ Live API용 간단한 그래프: 클라이언트가 보낸 대화 내역(바이�
 from __future__ import annotations
 
 import json
+import logging
 from typing import TypedDict
+
+logger = logging.getLogger(__name__)
 
 from langgraph.graph import END, StateGraph
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -137,8 +140,12 @@ def _generate_reply_node(state: LiveContextState) -> dict:
             response = llm_with_tools.invoke(messages)
 
         reply = (response.content or "").strip() if hasattr(response, "content") else str(response).strip()
-    except Exception:
+    except Exception as e:
+        logger.exception("generate_reply_node failed: %s", e)
         reply = ""
+
+    if not reply:
+        reply = "잠시만요, 다시 한번 말씀해 주실래요?"
 
     out: dict = {"reply": reply}
     if triggered_questions is not None:
