@@ -18,6 +18,18 @@ from app.api.users import router as users_router
 
 load_dotenv()
 
+# 서버 기동 시 설정된 환경변수 로그
+def _log_env():
+    env_keys = sorted(os.environ.keys())
+    print("\n=== Environment variables (server) ===")
+    for k in env_keys:
+        v = os.environ.get(k)
+        print(f"  {k}={v}")
+    print("=======================================\n")
+
+
+_log_env()
+
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
