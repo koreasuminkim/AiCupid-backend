@@ -5,101 +5,14 @@ load_dotenv()
 import os
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
-from typing import TypedDict, Annotated, List
-import operator
-import json
+
+from ai_agent import get_app_runnable
+from ai_agent.api import router as ai_agent_router
 
 # FastAPI 앱 먼저 생성 (퀴즈/LLM은 지연 로딩 → API 키 없어도 서버 기동 가능)
 app = FastAPI()
 
-_app_runnable = None
-
-
-def get_app_runnable():
-    """Gemini/퀴즈 체인은 첫 사용 시 로드 (GEMINI_API_KEY 없어도 서버는 뜸)"""
-    global _app_runnable
-    if _app_runnable is not None:
-        return _app_runnable
-
-    from langgraph.graph import StateGraph, END
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    from quiz_chain import QuizGrader, QuestionProvider, quiz_data, get_react_chain
-
-    class AgentState(TypedDict):
-        messages: Annotated[list, operator.add]
-        question_id: int
-        score: int
-        next_action: str
-
-    llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0)
-    react_chain = get_react_chain()
-
-    def router_node(state: AgentState):
-        last_message = state["messages"][-1]
-        action = "chat"
-        if state["question_id"] < len(quiz_data):
-            if len(state["messages"]) > 1 and state["messages"][-2][0] == "ai" and "질문" in state["messages"][-2][1]:
-                action = "grade"
-            else:
-                action = "ask"
-        else:
-            action = "finish"
-        if "퀴즈" in last_message[1] and "시작" in last_message[1]:
-            action = "ask"
-        print(f"Router decided action: {action}")
-        return {"next_action": action}
-
-    def grade_answer_node(state: AgentState):
-        user_message = state["messages"][-1]
-        user_answer = user_message[1]
-        q_id = state["question_id"]
-        grader = QuizGrader(user_answer=user_answer, question_id=q_id)
-        is_correct = grader.grade()
-        new_score = state["score"]
-        if is_correct:
-            new_score += 1
-            response_message = f"정답입니다! 현재 점수: {new_score}"
-        else:
-            correct_answer = quiz_data[q_id]["answer"]
-            response_message = f"아쉽네요. 정답은 '{correct_answer}'입니다. 현재 점수: {new_score}"
-        next_q_id = q_id + 1
-        return {
-            "messages": [("ai", response_message)],
-            "score": new_score,
-            "question_id": next_q_id,
-        }
-
-    def ask_question_node(state: AgentState):
-        q_id = state["question_id"]
-        provider = QuestionProvider(question_id=q_id)
-        question = provider.get_question()
-        message = f"퀴즈 질문입니다: {question}" if q_id < len(quiz_data) else question
-        return {"messages": [("ai", message)]}
-
-    def chat_node(state: AgentState):
-        response = llm.invoke(state["messages"])
-        return {"messages": [response]}
-
-    def decide_next_step(state: AgentState):
-        return state["next_action"]
-
-    workflow = StateGraph(AgentState)
-    workflow.add_node("router", router_node)
-    workflow.add_node("grade_answer", grade_answer_node)
-    workflow.add_node("ask_question", ask_question_node)
-    workflow.add_node("chat", chat_node)
-    workflow.set_entry_point("router")
-    workflow.add_conditional_edges(
-        "router",
-        decide_next_step,
-        {"grade": "grade_answer", "ask": "ask_question", "chat": "chat", "finish": END},
-    )
-    workflow.add_edge("grade_answer", "router")
-    workflow.add_edge("ask_question", "router")
-    workflow.add_edge("chat", "router")
-
-    _app_runnable = workflow.compile()
-    return _app_runnable
+app.include_router(ai_agent_router)
 
 
 # --- 라우트: API 키 없이 바로 응답 ---
@@ -151,7 +64,31 @@ async def invoke(data: dict):
     return {"response": last_ai_message, "state": result}
 
 
-# --- WebSocket: 첫 연결 시에만 speech/elevenlabs 로드 (키 없어도 서버는 뜸) ---
+# --- WebSocket: Gemini Live API (프론트 음성 청크 → Live API) ---
+
+@app.websocket("/ws/live")
+async def websocket_live(websocket: WebSocket):
+    """
+    프론트에서 끊어서 보낸 음성 청크를 Gemini Live API로 스트리밍합니다.
+    - 입력: binary (16-bit PCM, 16kHz, mono) 또는 JSON {"audio": "base64"}
+    - 출력: JSON {"type": "audio", "data": "base64"} (24kHz) / {"type": "text", "text": "..."} / {"type": "done"}
+    - 시스템 프롬프트: ai_agent.prompts (LangChain) 사용
+    - 참고: https://ai.google.dev/gemini-api/docs/live
+    """
+    await websocket.accept()
+    try:
+        from live_bridge import run_live_session
+        await run_live_session(websocket, system_instruction=None, use_langchain_prompt=True)
+    except Exception as e:
+        await websocket.send_json({"type": "error", "text": str(e)})
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+# --- WebSocket: Google STT + LangGraph + ElevenLabs (기존) ---
 
 @app.websocket("/ws/audio")
 async def websocket_endpoint(websocket: WebSocket):
