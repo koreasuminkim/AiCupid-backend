@@ -2,8 +2,6 @@ import io
 import wave
 import base64
 from langchain_google_genai import ChatGoogleGenerativeAI
-from google.cloud import texttospeech
-from gtts import gTTS
 import openai
 import io
 

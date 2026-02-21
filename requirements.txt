@@ -11,3 +11,4 @@ python-dotenv
 uvicorn
 langgraph-checkpoint-sqlite
 openai
+python-multipart
