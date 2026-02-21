@@ -18,4 +18,4 @@ COPY . .
 EXPOSE 8000
 
 # uv를 사용하여 uvicorn으로 애플리케이션을 실행합니다.
-CMD ["uv", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
