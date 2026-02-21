@@ -4,13 +4,28 @@ load_dotenv()
 
 import os
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 
 from ai_agent import get_app_runnable
 from ai_agent.api import router as ai_agent_router
 
-# FastAPI 앱 먼저 생성 (퀴즈/LLM은 지연 로딩 → API 키 없어도 서버 기동 가능)
-app = FastAPI()
+# FastAPI 앱 (설명에 WebSocket 문서 포함)
+APP_DESCRIPTION = """
+AiCupid Backend — FastAPI + LangGraph + Gemini Live.
+
+## WebSocket 엔드포인트 (Swagger에는 미표시, 아래에서 테스트)
+
+| 경로 | 용도 |
+|------|------|
+| **ws://localhost:8000/ws/live** | Gemini Live API — 프론트 음성 청크(PCM 16kHz) → Live API → 오디오/텍스트 응답 |
+| **ws://localhost:8000/ws/audio** | Google STT + LangGraph 퀴즈 + ElevenLabs TTS (음성 → 텍스트 → 퀴즈 → TTS) |
+
+**WebSocket 테스트 페이지:** [GET /test-ws](/test-ws)
+"""
+app = FastAPI(
+    title="AiCupid Backend API",
+    description=APP_DESCRIPTION,
+)
 
 app.include_router(ai_agent_router)
 
@@ -19,7 +34,15 @@ app.include_router(ai_agent_router)
 
 @app.get("/")
 def read_root():
-    return {"Hello": "LangGraph Quiz", "docs": "http://localhost:8000/docs"}
+    return {"Hello": "LangGraph Quiz", "docs": "http://localhost:8000/docs", "websocket_test": "http://localhost:8000/test-ws"}
+
+
+@app.get("/test-ws", response_class=HTMLResponse)
+def websocket_test_page():
+    """WebSocket 엔드포인트(/ws/live, /ws/audio) 연결 테스트용 페이지."""
+    path = os.path.join(os.path.dirname(__file__), "static", "websocket-test.html")
+    with open(path, encoding="utf-8") as f:
+        return f.read()
 
 
 @app.get("/health")
