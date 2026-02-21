@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 
 # API 라우터 임포트
 from app.database import engine, Base
+from app.models.voice_session import VoiceSession  # 테이블 생성 위해 import
+from app.models.voice_conversation_turn import VoiceConversationTurn
 from app.api.auth import router as auth_router
 from app.api.voice import router as voice_router
 from app.api.ws import router as ws_router
