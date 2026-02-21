@@ -9,7 +9,10 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
+from langchain_core.messages import HumanMessage, SystemMessage
+
 from app.database import get_db
+from app.models.user import User
 from app.models.voice_session import VoiceSession
 from app.models.voice_conversation_turn import VoiceConversationTurn
 from ai_agent.prompts import AI_MC_SYSTEM_PROMPT
@@ -154,8 +157,8 @@ def _reply_and_tts(reply: str) -> tuple[str, str]:
 @router.post("/first-conversation")
 async def first_conversation(
     file: Annotated[UploadFile, File(description="음성 파일 (wav, mp3 등)")],
-    user_id_1: Annotated[int, Form(description="참가 유저 ID 1")],
-    user_id_2: Annotated[int, Form(description="참가 유저 ID 2")],
+    user_id_1: Annotated[str, Form(description="참가 유저 ID 1")],
+    user_id_2: Annotated[str, Form(description="참가 유저 ID 2")],
     db: Session = Depends(get_db),
 ):
     """
@@ -266,6 +269,120 @@ async def continue_conversation(
     return {
         "reply": reply,
         "system_instruction": system_instruction,
+        "audio": audio_b64,
+        "mime_type": mime_type,
+    }
+
+
+# ----- 심리 테스트 질문 생성: 세션 기반 유저 정보 + 대화 히스토리 컨텍스트, MC 역할로 질문 1개 + 음성 -----
+
+
+def _user_summary(u: User) -> str:
+    """프롬프트용 유저 요약 (비밀번호 등 제외)."""
+    interests = getattr(u, "interests", None)
+    if isinstance(interests, list):
+        interests_str = ", ".join(str(x) for x in interests)
+    else:
+        interests_str = str(interests) if interests else ""
+    return (
+        f"이름={getattr(u, 'name', '')}, 성별={getattr(u, 'gender', '')}, 나이={getattr(u, 'age', '')}, "
+        f"관심사=[{interests_str}], MBTI={getattr(u, 'mbti', '') or '-'}, 소개={getattr(u, 'bio', '') or '-'}"
+    )
+
+
+@router.post("/psych-test")
+async def psych_test(
+    file: Annotated[UploadFile, File(description="음성 파일 (wav, mp3 등)")],
+    session_id: Annotated[str, Form(description="세션 ID")],
+    db: Session = Depends(get_db),
+):
+    """
+    음성 파일 + 세션 ID 받아서, 해당 세션의 두 유저 정보와 과거 대화 전체를 컨텍스트로 넣고
+    MC 역할로 심리 테스트 질문 하나를 제작. 질문 텍스트와 TTS 음성을 함께 반환.
+    """
+    session_id = (session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id는 필수입니다.")
+
+    # 세션에서 user_id 두 개 조회
+    first_session = (
+        db.query(VoiceSession)
+        .filter(VoiceSession.session_id == session_id)
+        .order_by(VoiceSession.created_at)
+        .first()
+    )
+    if not first_session:
+        raise HTTPException(status_code=400, detail="해당 session_id를 찾을 수 없습니다.")
+    user_id_1, user_id_2 = first_session.user_id_1, first_session.user_id_2
+
+    # 유저 테이블에서 두 명 정보 조회 (userId 기준). 없으면 무시하고 질문만 생성
+    users = db.query(User).filter(User.userId.in_([user_id_1, user_id_2])).all()
+    if len(users) != 2:
+        try:
+            u1 = db.query(User).filter(User.id == int(user_id_1)).first()
+            u2 = db.query(User).filter(User.id == int(user_id_2)).first()
+            users = [u for u in (u1, u2) if u is not None]
+        except (ValueError, TypeError):
+            pass
+    if len(users) == 2:
+        user1_summary = _user_summary(users[0])
+        user2_summary = _user_summary(users[1])
+    else:
+        user1_summary = "(참가자 프로필 없음)"
+        user2_summary = "(참가자 프로필 없음)"
+
+    # 세션 기준 과거 대화 전체
+    turns = (
+        db.query(VoiceConversationTurn)
+        .filter(VoiceConversationTurn.session_id == session_id)
+        .order_by(VoiceConversationTurn.created_at)
+        .all()
+    )
+    history_lines = []
+    for t in turns:
+        if t.user_text:
+            history_lines.append(f"- user: {t.user_text}")
+        history_lines.append(f"- ai: {t.assistant_reply or ''}")
+    history_block = "\n".join(history_lines) if history_lines else "(아직 대화 없음)"
+
+    # 음성 파일 → 전사 (최근 발화 컨텍스트)
+    _, _, recent_transcript = await _read_audio_and_transcribe(file)
+
+    # MC 역할 + 유저 정보 + 대화 히스토리 + 최근 발화 → 심리 테스트 질문 1개 생성
+    system = (
+        f"{AI_MC_SYSTEM_PROMPT.strip()}\n\n"
+        "역할: 당신은 **MC**이며, 소개팅/미팅에서 참가자들에게 **심리 테스트 질문**을 하나 제작합니다. "
+        "참가자 두 명의 프로필과 지금까지의 대화, 그리고 방금 전사된 발화를 참고해 "
+        "분위기에 맞는 심리 테스트 질문 **한 문장**만 출력하세요. 따옴표·설명 없이 질문만 출력하세요. 한국어로 하세요."
+    )
+    user_content = (
+        "[참가자 1]\n"
+        f"{user1_summary}\n\n"
+        "[참가자 2]\n"
+        f"{user2_summary}\n\n"
+        "[지금까지의 대화]\n"
+        f"{history_block}\n\n"
+        "[방금 전사된 발화]\n"
+        f"{recent_transcript or '(없음)'}\n\n"
+        "위 정보를 바탕으로 MC가 할 심리 테스트 질문 한 문장만 작성하세요."
+    )
+    from quiz_chain import get_llm
+
+    messages = [
+        SystemMessage(content=system),
+        HumanMessage(content=user_content),
+    ]
+    try:
+        response = get_llm().invoke(messages)
+        question = (response.content if hasattr(response, "content") else str(response)).strip()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    # 질문 텍스트 → TTS 음성
+    audio_b64, mime_type = _reply_and_tts(question)
+
+    return {
+        "question": question,
         "audio": audio_b64,
         "mime_type": mime_type,
     }

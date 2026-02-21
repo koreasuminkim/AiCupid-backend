@@ -30,6 +30,7 @@ gtts
 langgraph-checkpoint-sqlite
 openai
 python-multipart
+alembic
 sqlalchemy
 boto3
 passlib[bcrypt]

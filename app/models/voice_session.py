@@ -9,6 +9,6 @@ class VoiceSession(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     session_id = Column(String, index=True, nullable=False)
-    user_id_1 = Column(Integer, nullable=False)
-    user_id_2 = Column(Integer, nullable=False)
+    user_id_1 = Column(String, nullable=False)
+    user_id_2 = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
