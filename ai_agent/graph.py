@@ -9,10 +9,18 @@ import operator
 from typing import Annotated, TypedDict
 
 from langgraph.graph import END, StateGraph
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
 
 from ai_agent.prompts import AI_MC_SYSTEM_PROMPT
+from ai_agent.balance_game import generate_balance_game_questions
 from quiz_chain import QuizGrader, QuestionProvider, quiz_data, get_llm, get_react_chain
+
+
+@tool
+def start_balance_game() -> str:
+    """참가자가 밸런스 게임을 하자고 하거나, MC가 밸런스 게임을 제안·시작할 때 호출하세요. 대화 맥락에 맞는 밸런스 게임 질문 3개가 생성됩니다."""
+    return ""
 
 
 class AgentState(TypedDict):
@@ -92,8 +100,12 @@ def build_quiz_graph() -> StateGraph:
 
     def chat_node(state: AgentState):
         messages = state.get("messages") or []
-        # AI MC 역할(roles): 소개팅 상황에서 어색하지 않게 정보 전달
-        lc_messages = [SystemMessage(content=AI_MC_SYSTEM_PROMPT)]
+        # AI MC 역할 + 밸런스 게임 도구 사용 안내
+        system_content = (
+            AI_MC_SYSTEM_PROMPT
+            + "\n\n참가자가 밸런스 게임을 하자고 하거나 게임을 제안하면 start_balance_game 도구를 호출하세요."
+        )
+        lc_messages = [SystemMessage(content=system_content)]
         for m in messages:
             if isinstance(m, (list, tuple)) and len(m) >= 2:
                 role, content = m[0], m[1]
@@ -101,7 +113,41 @@ def build_quiz_graph() -> StateGraph:
                 role, content = "user", str(m)
             text = content if isinstance(content, str) else getattr(content, "content", str(content))
             lc_messages.append(HumanMessage(content=text) if role == "user" else AIMessage(content=text))
-        response = get_llm().invoke(lc_messages)
+
+        llm_with_tools = get_llm().bind_tools([start_balance_game])
+        response = llm_with_tools.invoke(lc_messages)
+
+        # 도구 호출이 있으면 실행 후 재호출
+        if getattr(response, "tool_calls", None):
+            tool_messages = []
+            for tc in response.tool_calls:
+                if tc.get("name") == "start_balance_game":
+                    # 대화 맥락 문자열 구성
+                    context_parts = []
+                    for m in messages:
+                        if isinstance(m, (list, tuple)) and len(m) >= 2:
+                            role, content = m[0], m[1]
+                        else:
+                            role, content = "user", str(m)
+                        text = content if isinstance(content, str) else getattr(content, "content", str(content))
+                        prefix = "user" if role == "user" else "ai"
+                        context_parts.append(f"- {prefix}: {text}")
+                    context = "\n".join(context_parts) if context_parts else "(아직 대화 없음)"
+                    questions = generate_balance_game_questions(context)
+                    if questions:
+                        lines = []
+                        for i, (q, a, b) in enumerate(questions, 1):
+                            lines.append(f"Q{i}: {q}\n  A: {a}\n  B: {b}")
+                        result = "밸런스 게임 질문 3개:\n" + "\n\n".join(lines)
+                    else:
+                        result = "밸런스 게임 질문 생성에 실패했습니다. 다시 시도해 주세요."
+                    tool_messages.append(
+                        ToolMessage(tool_call_id=tc["id"], content=result)
+                    )
+            lc_messages.append(response)
+            lc_messages.extend(tool_messages)
+            response = llm_with_tools.invoke(lc_messages)
+
         ai_content = response.content if hasattr(response, "content") else str(response)
         return {"messages": [("ai", ai_content)]}
 

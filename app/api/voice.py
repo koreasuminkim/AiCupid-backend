@@ -8,7 +8,8 @@ import uuid
 import wave
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -200,13 +201,20 @@ async def first_conversation(
     db.commit()
 
     audio_b64, mime_type = _reply_and_tts(reply)
-    return {
+    payload = {
         "session_id": session_id,
         "reply": reply,
         "system_instruction": system_instruction,
         "audio": audio_b64,
         "mime_type": mime_type,
     }
+    triggered = out.get("triggered_balance_game_questions")
+    if triggered and len(triggered) == 3:
+        payload["triggered_game"] = {
+            "type": "balance_game",
+            "questions": _balance_game_questions_to_response(session_id, db, triggered),
+        }
+    return payload
 
 
 # ----- 이어지는 대화: 전체 히스토리 로드 후 AI에 전달, 응답만 반환 -----
@@ -270,12 +278,19 @@ async def continue_conversation(
     db.commit()
 
     audio_b64, mime_type = _reply_and_tts(reply)
-    return {
+    payload = {
         "reply": reply,
         "system_instruction": system_instruction,
         "audio": audio_b64,
         "mime_type": mime_type,
     }
+    triggered = out.get("triggered_balance_game_questions")
+    if triggered and len(triggered) == 3:
+        payload["triggered_game"] = {
+            "type": "balance_game",
+            "questions": _balance_game_questions_to_response(session_id, db, triggered),
+        }
+    return payload
 
 
 # ----- 심리 테스트 질문 생성: 세션 기반 유저 정보 + 대화 히스토리 컨텍스트, MC 역할로 질문 1개 + 음성 -----
@@ -672,44 +687,12 @@ def _parse_balance_game_three(llm_output: str) -> list[tuple[str, str, str]] | N
     return result if len(result) == 3 else None
 
 
-@router.post("/balance-game-questions")
-async def balance_game_questions(
-    session_id: Annotated[str, Form(description="세션 ID")],
-    conversation_audio: Annotated[UploadFile | None, File(description="추가 대화 내용 음성 파일 (선택)")] = None,
-    db: Session = Depends(get_db),
-):
-    """
-    세션 ID를 받고, 선택적으로 추가 대화 내용 음성 파일을 받습니다. 해당 세션의 예전 대화를 검색해 활용하고
-    밸런스 게임 질문 3개를 생성합니다. 각 질문은 선택지 2개(A/B)이며,
-    질문 3개를 읽는 보이스 3개를 함께 프론트로 보냅니다.
-    """
-    session_id = (session_id or "").strip()
-    if not session_id:
-        raise HTTPException(status_code=400, detail="session_id는 필수입니다.")
-
-    # 예전 대화 내용 검색
-    turns = (
-        db.query(VoiceConversationTurn)
-        .filter(VoiceConversationTurn.session_id == session_id)
-        .order_by(VoiceConversationTurn.created_at)
-        .all()
-    )
-    history_lines = []
-    for t in turns:
-        if t.user_text:
-            history_lines.append(f"- user: {t.user_text}")
-        history_lines.append(f"- ai: {t.assistant_reply or ''}")
-    history_block = "\n".join(history_lines) if history_lines else "(아직 대화 없음)"
-    if conversation_audio:
-        try:
-            _, _, transcript = await _read_audio_and_transcribe(conversation_audio)
-            if transcript and transcript.strip():
-                history_block = history_block + "\n\n[추가 대화]\n" + transcript.strip()
-        except HTTPException:
-            raise
-        except Exception:
-            pass
-
+def _generate_balance_game_questions_impl(
+    session_id: str,
+    db: Session,
+    history_block: str,
+) -> list[dict]:
+    """세션 ID, DB, 대화 맥락 문자열을 받아 밸런스 게임 질문 3개 생성·DB 저장·TTS 후 결과 리스트 반환."""
     from quiz_chain import get_llm
 
     system = (
@@ -727,15 +710,11 @@ async def balance_game_questions(
         "위 대화 맥락을 활용해 참가자들이 고르기 좋은 밸런스 게임 질문 3개를 Q1/OPTION_A/OPTION_B 형식으로 출력하세요."
     )
     messages = [SystemMessage(content=system), HumanMessage(content=user_content)]
-    try:
-        response = get_llm().invoke(messages)
-        raw = (response.content if hasattr(response, "content") else str(response)).strip()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+    response = get_llm().invoke(messages)
+    raw = (response.content if hasattr(response, "content") else str(response)).strip()
 
     parsed = _parse_balance_game_three(raw)
     if not parsed or len(parsed) != 3:
-        # 폴백: 한 줄씩 간단 파싱 시도
         lines = [ln.strip() for ln in raw.split("\n") if ln.strip()]
         parsed_fallback = []
         i = 0
@@ -766,7 +745,6 @@ async def balance_game_questions(
             )
         )
         db.commit()
-        # 질문 읽는 TTS (예: "첫 번째. [질문 텍스트]")
         order = ["첫 번째", "두 번째", "세 번째"][idx]
         tts_sentence = f"{order}. {q_text}"
         audio_b64, mime_type = _reply_and_tts(tts_sentence)
@@ -778,6 +756,121 @@ async def balance_game_questions(
             "audio": audio_b64,
             "mime_type": mime_type,
         })
+    return results
+
+
+def _balance_game_questions_to_response(
+    session_id: str,
+    db: Session,
+    questions: list[tuple[str, str, str]],
+) -> list[dict]:
+    """에이전트가 트리거한 질문 3개 (q_text, option_a, option_b)를 DB 저장 + TTS 후 프론트용 리스트로 반환."""
+    if len(questions) != 3:
+        return []
+    results = []
+    for idx, (q_text, opt_a, opt_b) in enumerate(questions):
+        q_id = str(uuid.uuid4())
+        db.add(
+            BalanceGameQuestion(
+                question_id=q_id,
+                session_id=session_id,
+                question_text=q_text,
+                option_a=opt_a,
+                option_b=opt_b,
+            )
+        )
+        db.commit()
+        order = ["첫 번째", "두 번째", "세 번째"][idx]
+        tts_sentence = f"{order}. {q_text}"
+        audio_b64, mime_type = _reply_and_tts(tts_sentence)
+        results.append({
+            "question_id": q_id,
+            "question_text": q_text,
+            "option_a": opt_a,
+            "option_b": opt_b,
+            "audio": audio_b64,
+            "mime_type": mime_type,
+        })
+    return results
+
+
+class TriggerBalanceGameRequest(BaseModel):
+    """프론트에서 밸런스 게임 트리거 시 JSON body."""
+    session_id: str
+    additional_context: str | None = None
+
+
+@router.post("/balance-game/trigger")
+async def trigger_balance_game(
+    body: TriggerBalanceGameRequest = Body(...),
+    db: Session = Depends(get_db),
+):
+    """
+    프론트에서 밸런스 게임 버튼 등으로 게임을 트리거할 때 호출합니다.
+    JSON body: { "session_id": "필수", "additional_context": "선택(추가 맥락 텍스트)" }
+    해당 세션의 대화 히스토리를 바탕으로 질문 3개 + 각 TTS를 반환합니다.
+    """
+    session_id = (body.session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id는 필수입니다.")
+
+    turns = (
+        db.query(VoiceConversationTurn)
+        .filter(VoiceConversationTurn.session_id == session_id)
+        .order_by(VoiceConversationTurn.created_at)
+        .all()
+    )
+    history_lines = []
+    for t in turns:
+        if t.user_text:
+            history_lines.append(f"- user: {t.user_text}")
+        history_lines.append(f"- ai: {t.assistant_reply or ''}")
+    history_block = "\n".join(history_lines) if history_lines else "(아직 대화 없음)"
+    if body.additional_context and body.additional_context.strip():
+        history_block = history_block + "\n\n[추가 맥락]\n" + body.additional_context.strip()
+
+    results = _generate_balance_game_questions_impl(session_id, db, history_block)
+    return {"questions": results}
+
+
+@router.post("/balance-game-questions")
+async def balance_game_questions(
+    session_id: Annotated[str, Form(description="세션 ID")],
+    conversation_audio: Annotated[UploadFile | None, File(description="추가 대화 내용 음성 파일 (선택)")] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    세션 ID를 받고, 선택적으로 추가 대화 내용 음성 파일을 받습니다. 해당 세션의 예전 대화를 검색해 활용하고
+    밸런스 게임 질문 3개를 생성합니다. 각 질문은 선택지 2개(A/B)이며,
+    질문 3개를 읽는 보이스 3개를 함께 프론트로 보냅니다.
+    """
+    session_id = (session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id는 필수입니다.")
+
+    turns = (
+        db.query(VoiceConversationTurn)
+        .filter(VoiceConversationTurn.session_id == session_id)
+        .order_by(VoiceConversationTurn.created_at)
+        .all()
+    )
+    history_lines = []
+    for t in turns:
+        if t.user_text:
+            history_lines.append(f"- user: {t.user_text}")
+        history_lines.append(f"- ai: {t.assistant_reply or ''}")
+    history_block = "\n".join(history_lines) if history_lines else "(아직 대화 없음)"
+    if conversation_audio:
+        try:
+            _, _, transcript = await _read_audio_and_transcribe(conversation_audio)
+            if transcript and transcript.strip():
+                history_block = history_block + "\n\n[추가 대화]\n" + transcript.strip()
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    results = _generate_balance_game_questions_impl(session_id, db, history_block)
     return {"questions": results}
 
 

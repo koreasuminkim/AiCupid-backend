@@ -11,9 +11,17 @@ import json
 from typing import TypedDict
 
 from langgraph.graph import END, StateGraph
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
 
 from ai_agent.prompts import AI_MC_SYSTEM_PROMPT
+from ai_agent.balance_game import generate_balance_game_questions
+
+
+@tool
+def start_balance_game() -> str:
+    """참가자가 밸런스 게임을 하자고 하거나, MC가 밸런스 게임을 제안·시작할 때 호출하세요. 대화 맥락에 맞는 밸런스 게임 질문 3개가 생성됩니다."""
+    return ""
 
 
 class LiveContextState(TypedDict, total=False):
@@ -24,6 +32,7 @@ class LiveContextState(TypedDict, total=False):
     conversation: list[tuple[str, str]]  # (role, content)
     system_instruction: str
     reply: str  # MC가 할 답변(새 질문/말) — Studio 등에서 출력용
+    triggered_balance_game_questions: list[tuple[str, str, str]]  # (question_text, option_a, option_b) 3개, 에이전트가 게임 트리거 시
 
 
 def _parse_conversation_node(state: LiveContextState) -> dict:
@@ -78,7 +87,8 @@ def _build_instruction_node(state: LiveContextState) -> dict:
         parts.append(
             f"{context_block}\n\n"
             "위 대화 내역을 기반으로 참가자에게 자연스러운 **새 질문**을 하거나, 대화를 이어가세요. "
-            "맥락에 맞는 질문으로 분위기를 이끌어 주세요."
+            "맥락에 맞는 질문으로 분위기를 이끌어 주세요. "
+            "참가자가 밸런스 게임을 하자고 하면 start_balance_game 도구를 호출하세요."
         )
 
     system_instruction = "\n\n".join(parts)
@@ -86,7 +96,7 @@ def _build_instruction_node(state: LiveContextState) -> dict:
 
 
 def _generate_reply_node(state: LiveContextState) -> dict:
-    """시스템 지시문 + 대화 맥락으로 MC 답변(새 질문/말) 한 문장 생성. Studio에서 답변 출력용."""
+    """시스템 지시문 + 대화 맥락으로 MC 답변(새 질문/말) 생성. 밸런스 게임 요청 시 도구로 질문 3개 생성 후 답변에 포함."""
     instruction = state.get("system_instruction") or ""
     conv = state.get("conversation") or []
     if not instruction:
@@ -99,14 +109,41 @@ def _generate_reply_node(state: LiveContextState) -> dict:
             messages.append(HumanMessage(content=content))
         else:
             messages.append(AIMessage(content=content))
-    # 마지막에 MC가 할 말을 생성하라고 한 번만 요청
-    messages.append(HumanMessage(content="위 대화 맥락에 맞게, MC로서 참가자에게 할 한 문장(인사·질문·말)만 짧게 답해 주세요. 따옴표나 설명 없이 말만 출력하세요."))
+    messages.append(HumanMessage(content="위 대화 맥락에 맞게, MC로서 참가자에게 할 한 문장(인사·질문·말)만 짧게 답해 주세요. 따옴표나 설명 없이 말만 출력하세요. 단, 밸런스 게임을 시작할 때는 start_balance_game 도구를 먼저 호출한 뒤, 그 결과를 활용해 답하세요."))
+
+    triggered_questions: list[tuple[str, str, str]] | None = None
     try:
-        response = get_llm().invoke(messages)
+        llm_with_tools = get_llm().bind_tools([start_balance_game])
+        response = llm_with_tools.invoke(messages)
+
+        if getattr(response, "tool_calls", None):
+            tool_messages = []
+            for tc in response.tool_calls:
+                if tc.get("name") == "start_balance_game":
+                    context_parts = [f"- {role}: {content}" for role, content in conv]
+                    context = "\n".join(context_parts) if context_parts else "(아직 대화 없음)"
+                    questions = generate_balance_game_questions(context)
+                    if questions and len(questions) == 3:
+                        triggered_questions = questions
+                        lines = []
+                        for i, (q, a, b) in enumerate(questions, 1):
+                            lines.append(f"Q{i}: {q}  A: {a}  B: {b}")
+                        result = "밸런스 게임 질문 3개: " + " | ".join(lines)
+                    else:
+                        result = "밸런스 게임 질문 생성에 실패했습니다."
+                    tool_messages.append(ToolMessage(tool_call_id=tc["id"], content=result))
+            messages.append(response)
+            messages.extend(tool_messages)
+            response = llm_with_tools.invoke(messages)
+
         reply = (response.content or "").strip() if hasattr(response, "content") else str(response).strip()
     except Exception:
         reply = ""
-    return {"reply": reply}
+
+    out: dict = {"reply": reply}
+    if triggered_questions is not None:
+        out["triggered_balance_game_questions"] = triggered_questions
+    return out
 
 
 def build_live_context_graph() -> StateGraph:
