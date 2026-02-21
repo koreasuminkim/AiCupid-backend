@@ -16,7 +16,7 @@ from app.models.user import User
 from app.schemas.user import RegisterRequest, LoginRequest
 from app.schemas.user import UserCreate, UserResponse
 
-PWD_CONTEXT = CryptContext(schemes=["bcrypt"], deprecated="auto")
+PWD_CONTEXT = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "fallback-for-local-dev")
 ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 
