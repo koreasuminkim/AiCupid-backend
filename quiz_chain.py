@@ -13,7 +13,7 @@ def get_llm():
     """LangGraph 등에서 사용할 LLM 싱글톤. 첫 호출 시에만 생성."""
     global _llm
     if _llm is None:
-        _llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.7)
+        _llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.7)
     return _llm
 
 

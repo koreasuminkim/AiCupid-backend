@@ -21,7 +21,7 @@ def get_app_runnable():
     from langchain_google_genai import ChatGoogleGenerativeAI
     from quiz_chain import QuizGrader, QuestionProvider, quiz_data
 
-    llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
 
     # --- 기존 노드 로직 (동일) ---
     def router_node(state: AgentState):

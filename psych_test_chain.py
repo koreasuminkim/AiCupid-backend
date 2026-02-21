@@ -6,7 +6,7 @@ import json
 from typing import List, Dict
 
 # LLM 모델 초기화
-llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.7)
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.7)
 
 class TestQuestionGenerator(BaseModel):
     """두 사람의 관계와 성향을 알아보기 위한 심리테스트 질문 3개를 생성합니다."""
