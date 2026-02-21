@@ -30,16 +30,26 @@
   <section>
     <label>엔드포인트</label>
     <select id="endpoint">
+      <option value="/ws/quiz-text">/ws/quiz-text — 퀴즈 로직 테스트 (텍스트 주고받기)</option>
       <option value="/ws/live">/ws/live — Gemini Live API (음성 스트리밍)</option>
       <option value="/ws/audio">/ws/audio — STT + 퀴즈 + TTS</option>
     </select>
-    <div class="hint" id="hint">ws/live: 프론트에서 PCM 16kHz 청크(binary 또는 JSON {"audio":"base64"}) 전송 → 오디오/텍스트 수신</div>
+    <div class="hint" id="hint">ws/quiz-text: JSON {"text":"퀴즈 시작"} 전송 → 퀴즈 그래프 실행 후 응답 수신 (로직 테스트용)</div>
   </section>
 
   <section>
     <button id="btnConnect">연결</button>
     <button id="btnDisconnect" disabled>연결 끊기</button>
     <div id="status" class="status closed">연결 안 됨</div>
+  </section>
+
+  <section id="sectionSendText" style="display: none;">
+    <label>텍스트 보내기 (퀴즈 테스트)</label>
+    <div style="display: flex; gap: 0.5rem; margin-bottom: 0.5rem;">
+      <input type="text" id="textInput" placeholder="예: 퀴즈 시작" style="flex: 1; padding: 0.5rem;" />
+      <button id="btnSendText">전송</button>
+    </div>
+    <div class="hint">예: "퀴즈 시작" → 첫 질문, "서울" → 답안 제출, 그 외 → 일반 대화</div>
   </section>
 
   <section>
@@ -56,12 +66,14 @@
     const logEl = document.getElementById('log');
 
     const hints = {
+      '/ws/quiz-text': 'ws/quiz-text: JSON {"text":"퀴즈 시작"} 전송 → 퀴즈 그래프 실행 후 응답 수신 (로직 테스트용)',
       '/ws/live': 'ws/live: 프론트에서 PCM 16kHz 청크(binary 또는 JSON {"audio":"base64"}) 전송 → 오디오/텍스트 수신',
       '/ws/audio': 'ws/audio: 바이너리 음성 스트림 전송 → STT → 퀴즈 → TTS 오디오 수신'
     };
 
     endpointSelect.addEventListener('change', () => {
       hint.textContent = hints[endpointSelect.value] || '';
+      document.getElementById('sectionSendText').style.display = endpointSelect.value === '/ws/quiz-text' ? 'block' : 'none';
     });
 
     let ws = null;
@@ -90,6 +102,7 @@
       ws.onopen = () => {
         log('연결됨', 'sys');
         setStatus(true);
+        document.getElementById('sectionSendText').style.display = endpointSelect.value === '/ws/quiz-text' ? 'block' : 'none';
       };
 
       ws.onmessage = (ev) => {
@@ -99,6 +112,7 @@
             const type = obj.type || 'message';
             if (type === 'audio') log(`[audio] base64 길이: ${(obj.data || '').length}`, 'in');
             else if (type === 'text') log(`[text] ${obj.text || ''}`, 'in');
+            else if (type === 'response') log(`[응답] ${obj.text || ''} (question_id=${(obj.state && obj.state.question_id) ?? '-'}, score=${(obj.state && obj.state.score) ?? '-'})`, 'in');
             else log(ev.data, 'in');
           } catch {
             log(ev.data, 'in');
@@ -113,7 +127,18 @@
         log('연결 종료', 'sys');
         setStatus(false);
         ws = null;
+        document.getElementById('sectionSendText').style.display = 'none';
       };
+    });
+
+    document.getElementById('btnSendText').addEventListener('click', () => {
+      const input = document.getElementById('textInput');
+      const text = (input && input.value && input.value.trim()) || '';
+      if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+      const payload = JSON.stringify({ text: text });
+      ws.send(payload);
+      log('전송: ' + payload, 'out');
+      input.value = '';
     });
 
     btnDisconnect.addEventListener('click', () => {

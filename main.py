@@ -3,195 +3,107 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, HTMLResponse
+from typing import Annotated
 
-from ai_agent import get_app_runnable
-from ai_agent.api import router as ai_agent_router
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 
-# FastAPI 앱 (설명에 WebSocket 문서 포함)
-APP_DESCRIPTION = """
-AiCupid Backend — FastAPI + LangGraph + Gemini Live.
+from audio_to_text_graph import build_audio_to_text_graph
 
-## WebSocket 엔드포인트 (Swagger에는 미표시, 아래에서 테스트)
-
-| 경로 | 용도 |
-|------|------|
-| **ws://localhost:8000/ws/live** | Gemini Live API — 프론트 음성 청크(PCM 16kHz) → Live API → 오디오/텍스트 응답 |
-| **ws://localhost:8000/ws/audio** | Google STT + LangGraph 퀴즈 + ElevenLabs TTS (음성 → 텍스트 → 퀴즈 → TTS) |
-
-**WebSocket 테스트 페이지:** [GET /test-ws](/test-ws)
-"""
 app = FastAPI(
     title="AiCupid Backend API",
-    description=APP_DESCRIPTION,
+    description="음성 파일을 텍스트로 변환하는 API (Gemini + LangGraph).",
 )
 
-app.include_router(ai_agent_router)
-
-
-# --- 라우트: API 키 없이 바로 응답 ---
 
 @app.get("/")
 def read_root():
-    return {"Hello": "LangGraph Quiz", "docs": "http://localhost:8000/docs", "websocket_test": "http://localhost:8000/test-ws"}
-
-
-@app.get("/test-ws", response_class=HTMLResponse)
-def websocket_test_page():
-    """WebSocket 엔드포인트(/ws/live, /ws/audio) 연결 테스트용 페이지."""
-    path = os.path.join(os.path.dirname(__file__), "static", "websocket-test.html")
-    with open(path, encoding="utf-8") as f:
-        return f.read()
+    return {"service": "AiCupid-backend", "docs": "/docs"}
 
 
 @app.get("/health")
-async def health():
-    """서버 상태 확인용 헬스체크 API"""
+def health():
     return {"status": "ok", "service": "AiCupid-backend"}
 
 
-@app.get("/api/hello")
-async def hello(name: str = "Guest"):
-    """간단한 인사 API - 쿼리: ?name=이름"""
-    from datetime import datetime
-    return {"message": f"Hello, {name}!", "timestamp": datetime.now().isoformat()}
+# --- 음성 → 텍스트 (LangGraph + Gemini) ---
+
+_AUDIO_TO_TEXT_RUNNABLE = None
 
 
-@app.post("/invoke")
-async def invoke(data: dict):
+def _get_audio_to_text_runnable():
+    global _AUDIO_TO_TEXT_RUNNABLE
+    if _AUDIO_TO_TEXT_RUNNABLE is None:
+        _AUDIO_TO_TEXT_RUNNABLE = build_audio_to_text_graph().compile()
+    return _AUDIO_TO_TEXT_RUNNABLE
+
+
+# 업로드 허용 MIME (Gemini 지원 형식)
+AUDIO_MIME_TYPES = {
+    "audio/wav",
+    "audio/wave",
+    "audio/x-wav",
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/ogg",
+    "audio/webm",
+    "audio/flac",
+    "audio/mp4",
+}
+
+
+@app.post("/api/audio-to-text")
+async def audio_to_text(
+    file: Annotated[UploadFile, File(description="음성 파일 (wav, mp3, ogg, webm, flac 등)")],
+):
     """
-    LangGraph 퀴즈 체인을 호출합니다. (GEMINI_API_KEY 필요)
+    음성 파일을 업로드하면 Gemini로 텍스트로 변환해 반환합니다.
+    LangGraph로 변환 파이프라인을 구성합니다.
     """
-    try:
-        runnable = get_app_runnable()
-    except Exception as e:
-        return JSONResponse(
-            status_code=503,
-            content={"error": f"퀴즈 엔진 초기화 실패 (GEMINI_API_KEY 확인): {e}"},
-        )
-
-    user_input = data.get("input")
-    if not user_input:
-        return JSONResponse(status_code=400, content={"error": "Input message is required"})
-
-    current_state = data.get("state", {"messages": [], "question_id": 0, "score": 0})
-    current_state["messages"] = current_state.get("messages", []) + [("user", user_input)]
-
-    result = runnable.invoke(current_state)
-    last_ai_message = ""
-    for role, msg in reversed(result["messages"]):
-        if role == "ai":
-            last_ai_message = msg
-            break
-    return {"response": last_ai_message, "state": result}
-
-
-# --- WebSocket: Gemini Live API (프론트 음성 청크 → Live API) ---
-
-@app.websocket("/ws/live")
-async def websocket_live(websocket: WebSocket):
-    """
-    프론트에서 끊어서 보낸 음성 청크를 Gemini Live API로 스트리밍합니다.
-    - 입력: binary (16-bit PCM, 16kHz, mono) 또는 JSON {"audio": "base64"}
-    - 출력: JSON {"type": "audio", "data": "base64"} (24kHz) / {"type": "text", "text": "..."} / {"type": "done"}
-    - 시스템 프롬프트: ai_agent.prompts (LangChain) 사용
-    - 참고: https://ai.google.dev/gemini-api/docs/live
-    """
-    await websocket.accept()
-    try:
-        from live_bridge import run_live_session
-        await run_live_session(websocket, system_instruction=None, use_langchain_prompt=True)
-    except Exception as e:
-        await websocket.send_json({"type": "error", "text": str(e)})
-    finally:
-        try:
-            await websocket.close()
-        except Exception:
-            pass
-
-
-# --- WebSocket: Google STT + LangGraph + ElevenLabs (기존) ---
-
-@app.websocket("/ws/audio")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-
-    try:
-        from google.cloud import speech
-        from elevenlabs.client import ElevenLabs
-        from elevenlabs import stream as elevenlabs_stream
-    except Exception as e:
-        await websocket.send_json({"type": "error", "text": f"의존성 로드 실패: {e}"})
-        await websocket.close(code=1011, reason=str(e))
-        return
-
-    speech_client = speech.SpeechClient()
-    elevenlabs_client = ElevenLabs(api_key=os.environ.get("ELEVENLABS_API_KEY"))
-    streaming_config = speech.StreamingRecognitionConfig(
-        config=speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=16000,
-            language_code="ko-KR",
-        ),
-        interim_results=True,
-    )
-
-    try:
-        graph_state = {"messages": [], "question_id": 0, "score": 0}
-        runnable = get_app_runnable()
-
-        while True:
-            stt_requests = (
-                speech.StreamingRecognizeRequest(audio_content=chunk)
-                async for chunk in websocket.iter_bytes()
+    if not file.content_type or file.content_type.lower() not in AUDIO_MIME_TYPES:
+        # content_type이 비어 있거나 목록에 없으면 파일 확장자로 추정
+        name = (file.filename or "").lower()
+        if not any(name.endswith(ext) for ext in (".wav", ".mp3", ".ogg", ".webm", ".flac", ".m4a", ".mp4")):
+            raise HTTPException(
+                status_code=400,
+                detail=f"지원 형식: {', '.join(sorted(AUDIO_MIME_TYPES))}. filename 또는 Content-Type 필요.",
             )
-            stt_responses = speech_client.streaming_recognize(
-                config=streaming_config, requests=stt_requests
-            )
+        mime_type = "audio/wav"
+        if name.endswith(".mp3") or name.endswith(".mpeg"):
+            mime_type = "audio/mpeg"
+        elif name.endswith(".ogg"):
+            mime_type = "audio/ogg"
+        elif name.endswith(".webm"):
+            mime_type = "audio/webm"
+        elif name.endswith(".flac"):
+            mime_type = "audio/flac"
+        elif name.endswith(".mp4") or name.endswith(".m4a"):
+            mime_type = "audio/mp4"
+    else:
+        mime_type = file.content_type.lower()
 
-            transcript = ""
-            for response in stt_responses:
-                if not response.results:
-                    continue
-                result = response.results[0]
-                if not result.alternatives:
-                    continue
-                if not result.is_final:
-                    await websocket.send_json({"type": "interim_transcript", "text": result.alternatives[0].transcript})
-                else:
-                    transcript = result.alternatives[0].transcript
-                    await websocket.send_json({"type": "final_transcript", "text": transcript})
-                    break
-
-            if not transcript:
-                continue
-
-            graph_state["messages"] = graph_state.get("messages", []) + [("user", transcript)]
-            graph_result = runnable.invoke(graph_state)
-            graph_state = graph_result
-
-            ai_response_text = ""
-            for role, msg in reversed(graph_result["messages"]):
-                if role == "ai":
-                    ai_response_text = msg
-                    break
-            if not ai_response_text:
-                continue
-
-            await websocket.send_json({"type": "ai_response_text", "text": ai_response_text})
-
-            audio_stream = elevenlabs_client.generate(
-                text=ai_response_text,
-                model="eleven_multilingual_v2",
-                stream=True,
-            )
-            for chunk in elevenlabs_stream(audio_stream):
-                await websocket.send_bytes(chunk)
-            await websocket.send_json({"type": "audio_stream_end"})
-
-    except WebSocketDisconnect:
-        print("Client disconnected")
+    try:
+        audio_bytes = await file.read()
     except Exception as e:
-        print(f"An error occurred: {e}")
-        await websocket.close(code=1011, reason=str(e))
+        raise HTTPException(status_code=400, detail=f"파일 읽기 실패: {e}")
+
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="빈 파일입니다.")
+
+    try:
+        runnable = _get_audio_to_text_runnable()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"엔진 초기화 실패 (GEMINI_API_KEY 확인): {e}")
+
+    state = {
+        "audio_bytes": audio_bytes,
+        "mime_type": mime_type,
+        "text": "",
+        "error": "",
+    }
+    result = runnable.invoke(state)
+
+    if result.get("error"):
+        raise HTTPException(status_code=502, detail=result["error"])
+
+    return {"text": result.get("text", "")}
