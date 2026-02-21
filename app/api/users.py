@@ -74,10 +74,57 @@ async def get_my_profile(current_user: User = Depends(get_current_user)):
         profileImage=current_user.profile_image_url
     )
 
+@router.get("/search", response_model=MatchableUserListResponse)
+async def search_users_by_id(
+    userId_query: Optional[str] = Query(None, alias="userId", description="검색할 유저 ID (부분 일치)"),
+    skip: int = 0,
+    limit: int = 15,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    userId로 유저를 검색합니다. 
+    검색어가 없으면 전체 유저를 가입순(최신순)으로 나열합니다.
+    """
+    # 1. 기본 쿼리 생성: 본인 제외
+    query = db.query(User).filter(User.userId != current_user.userId)
+
+    # 2. userId 검색 조건 추가 (부분 일치 검색)
+    if userId_query:
+        # User.userId에 검색어가 포함되어 있는지 확인 (LIKE %query%)
+        query = query.filter(User.userId.contains(userId_query))
+
+    # 3. 가입순 정렬 (ID가 클수록 최신 가입자)
+    query = query.order_by(User.id.desc())
+
+    # 4. 전체 개수 구하기 (페이지네이션 전)
+    total_count = query.count()
+
+    # 5. 페이지네이션 적용 (skip, limit)
+    searched_users = query.offset(skip).limit(limit).all()
+
+    # 6. 응답 데이터 변환
+    result = [
+        MatchableUserResponse(
+            userId=u.userId,
+            name=u.name,
+            age=u.age,
+            gender=u.gender,
+            mbti=u.mbti,
+            interests=u.interests,
+            profileImage=u.profile_image_url
+        ) for u in searched_users
+    ]
+
+    return {
+        "users": result,
+        "total_count": total_count
+    }
+
 @router.get("/matchable", response_model=MatchableUserListResponse)
 async def get_matchable_users(
     skip: int = 0,
-    limit: int = 20,
+    limit: int = 15,
     sort_by: str = Query(None, description="정렬 기준: mbti, interests"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
