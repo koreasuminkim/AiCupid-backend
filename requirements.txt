@@ -12,3 +12,6 @@ uvicorn
 langgraph-checkpoint-sqlite
 openai
 python-multipart
+sqlalchemy
+boto3
+python-multipart
