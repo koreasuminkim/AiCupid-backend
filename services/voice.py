@@ -2,6 +2,8 @@ import io
 import wave
 import base64
 from langchain_google_genai import ChatGoogleGenerativeAI
+from google.cloud import texttospeech
+from gtts import gTTS
 import openai
 import io
 
@@ -37,3 +39,23 @@ async def text_to_speech_openai(text: str) -> bytes:
         response_format="wav" # 여기서 wav로 지정
     )
     return response.content
+
+"""
+    # ── TTS: Google Cloud TTS ──
+    async def text_to_speech_google(text: str) -> bytes:
+        client = texttospeech.TextToSpeechClient()
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="ko-KR", 
+            name="ko-KR-Standard-A", # 테스트용 여성 음성
+            ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
+        )
+        # 프론트 명세에 맞춰 WAV 형식으로 생성
+        audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.LINEAR16)
+
+        response = client.synthesize_speech(
+            input=synthesis_input, voice=voice, audio_config=audio_config
+        )
+        return response.audio_content
+"""

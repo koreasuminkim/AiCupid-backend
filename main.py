@@ -30,7 +30,6 @@ app = FastAPI(
 def read_root():
     return {"service": "AiCupid-backend", "docs": "/docs"}
 
-
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "AiCupid-backend"}

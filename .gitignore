@@ -9,6 +9,20 @@
 # macOS
 .DS_Store
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+wheels/
+*.egg
 repomix-output.xml
 
 *.venv
