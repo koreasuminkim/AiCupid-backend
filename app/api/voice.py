@@ -781,6 +781,68 @@ async def balance_game_questions(
     return {"questions": results}
 
 
+# ----- 밸런스 게임 결과: 세션 + 질문 3개 텍스트 + 정답 음성 3개 → 궁합 정도 텍스트·음성 -----
+
+
+@router.post("/balance-game-result")
+async def balance_game_result(
+    session_id: Annotated[str, Form(description="세션 ID")],
+    question_text_1: Annotated[str, Form(description="밸런스 게임 질문 1")],
+    question_text_2: Annotated[str, Form(description="밸런스 게임 질문 2")],
+    question_text_3: Annotated[str, Form(description="밸런스 게임 질문 3")],
+    file_1: Annotated[UploadFile, File(description="질문 1에 대한 정답 음성")],
+    file_2: Annotated[UploadFile, File(description="질문 2에 대한 정답 음성")],
+    file_3: Annotated[UploadFile, File(description="질문 3에 대한 정답 음성")],
+):
+    """
+    세션 ID, 질문 텍스트 3개, 각 질문에 대한 정답 음성 3개를 받아
+    전사 후 궁합 정도에 대한 분석 텍스트를 생성하고, 해당 텍스트를 TTS한 음성과 함께 반환합니다.
+    """
+    session_id = (session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id는 필수입니다.")
+    q1 = (question_text_1 or "").strip() or "질문1"
+    q2 = (question_text_2 or "").strip() or "질문2"
+    q3 = (question_text_3 or "").strip() or "질문3"
+
+    # 정답 음성 3개 전사
+    _, _, answer_1 = await _read_audio_and_transcribe(file_1)
+    _, _, answer_2 = await _read_audio_and_transcribe(file_2)
+    _, _, answer_3 = await _read_audio_and_transcribe(file_3)
+    answer_1 = (answer_1 or "").strip()
+    answer_2 = (answer_2 or "").strip()
+    answer_3 = (answer_3 or "").strip()
+
+    from quiz_chain import get_llm
+
+    system = (
+        "당신은 소개팅/미팅 MC이자 궁합 분석가입니다. "
+        "참가자 두 명이 밸런스 게임 3개에 답한 내용을 바탕으로, "
+        "두 사람의 **궁합 정도**를 2~4문장으로 친절하고 재미있게 분석해 주세요. "
+        "따옴표나 제목 없이 분석 문단만 출력하세요. 한국어로 하세요."
+    )
+    user_content = (
+        "[질문 1] " + q1 + "\n참가자 답: " + answer_1 + "\n\n"
+        "[질문 2] " + q2 + "\n참가자 답: " + answer_2 + "\n\n"
+        "[질문 3] " + q3 + "\n참가자 답: " + answer_3 + "\n\n"
+        "위 세 질문에 대한 답변을 바탕으로 두 참가자의 궁합 정도를 2~4문장으로 분석해 주세요."
+    )
+    messages = [SystemMessage(content=system), HumanMessage(content=user_content)]
+    try:
+        response = get_llm().invoke(messages)
+        result_text = (response.content if hasattr(response, "content") else str(response)).strip()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    audio_b64, mime_type = _reply_and_tts(result_text)
+
+    return {
+        "result_text": result_text,
+        "audio": audio_b64,
+        "mime_type": mime_type,
+    }
+
+
 # ----- 퀴즈 O/X 결과: 음성 + 퀴즈 ID + 세션 ID → 정답 여부 판정 -----
 
 
