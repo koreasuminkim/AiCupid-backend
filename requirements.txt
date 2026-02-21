@@ -1,15 +1,20 @@
-langchain==0.1.16
-langchain-core==0.1.45
-langchain-google-genai==1.0.1
-pydantic==1.10.13
+# LangChain Core
+langchain-core>=0.2.0
+
+# LangChain Community and specific integrations
+langchain-community
+langchain-google-genai
+langchain-openai
+
+# Pydantic v2 is now compatible with recent langchain versions
+pydantic
+
+# Application Server and Framework
+uv
 uvicorn
 fastapi
-gunicorn
-python-dotenv
+
+# Other dependencies
 elevenlabs
 google-cloud-speech
-langsmith
-langgraph
-langgraph-checkpoint-sqlite
-gTTS
-openai
+python-dotenv
