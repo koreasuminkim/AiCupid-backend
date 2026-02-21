@@ -5,6 +5,7 @@ load_dotenv()
 import os
 import json
 import base64
+import uuid
 from uuid import uuid4
 from services.voice import speech_to_text_gemini, text_to_speech_openai
 from ai_agent.graph import get_compiled_graph
