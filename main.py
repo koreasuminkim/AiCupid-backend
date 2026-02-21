@@ -3,6 +3,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
+import json
+import base64
+from uuid import uuid4
+from services.voice import speech_to_text_gemini, text_to_speech_openai
+from ai_agent.graph import get_compiled_graph
 from typing import Annotated
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -107,3 +112,48 @@ async def audio_to_text(
         raise HTTPException(status_code=502, detail=result["error"])
 
     return {"text": result.get("text", "")}
+
+
+@app.websocket("/ws/quiz") # 사용자님 전용 엔드포인트 분리
+async def websocket_quiz_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    
+    session_id = websocket.query_params.get("session_id", str(uuid4()))
+    config = {"configurable": {"thread_id": session_id}} # 세션 유지
+    
+    runnable = get_compiled_graph()
+    audio_chunks = []
+
+    try:
+        while True:
+            message = await websocket.receive()
+            if "bytes" in message:
+                audio_chunks.append(message["bytes"])
+            elif "text" in message:
+                data = json.loads(message["text"])
+                
+                # 'speech_end' 신호 시 사용자님만의 STT -> Agent -> TTS 루프 실행
+                if data.get("type") == "speech_end" and audio_chunks:
+                    raw_pcm = b"".join(audio_chunks)
+                    audio_chunks = []
+                    
+                    # 1. STT (사용자 기능)
+                    transcript = await speech_to_text_gemini(raw_pcm)
+                    await websocket.send_json({"type": "final_transcript", "text": transcript})
+
+                    # 2. Agent (사용자 기능 + 기반 구조)
+                    result = await runnable.ainvoke({"messages": [("user", transcript)]}, config=config)
+                    
+                    # 3. AI 답변 추출
+                    ai_text = result["messages"][-1][1] if result["messages"] else "죄송해요."
+                    await websocket.send_json({"type": "ai_response_text", "text": ai_text})
+
+                    # 4. OpenAI TTS (사용자 기능)
+                    audio_content = await text_to_speech_openai(ai_text)
+                    await websocket.send_json({
+                        "type": "audio",
+                        "data": base64.b64encode(audio_content).decode("utf-8"),
+                        "mime_type": "audio/wav"
+                    })
+    except WebSocketDisconnect:
+        print(f"Disconnected: {session_id}")

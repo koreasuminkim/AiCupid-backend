@@ -9,3 +9,5 @@ langsmith
 pydantic
 python-dotenv
 uvicorn
+langgraph-checkpoint-sqlite
+openai
