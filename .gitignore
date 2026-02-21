@@ -1,6 +1,3 @@
-node_modules/
-dist/
-
 # Environment variables (API keys — DO NOT commit)
 .env
 
@@ -26,3 +23,6 @@ dist/
 build/
 wheels/
 *.egg
+repomix-output.xml
+
+*.venv

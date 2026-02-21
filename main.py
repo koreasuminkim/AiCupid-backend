@@ -1,63 +1,131 @@
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import os
 import json
 import base64
-from datetime import datetime
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile
-from fastapi.responses import JSONResponse
+import uuid
 from uuid import uuid4
-from typing import Optional
 
-from services.agent import get_app_runnable
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
+
 from services.voice import speech_to_text_gemini, text_to_speech_openai
-from services.s3_service import upload_file_to_s3
+from ai_agent.graph import get_compiled_graph
+from typing import Annotated
 
-app = FastAPI()
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
+
+from audio_to_text_graph import build_audio_to_text_graph
+
+app = FastAPI(
+    title="AiCupid Backend API",
+    description="음성 파일을 텍스트로 변환하는 API (Gemini + LangGraph).",
+)
+
 
 @app.get("/")
 def read_root():
-    return {"Hello": "LangGraph Quiz", "docs": "http://localhost:8000/docs"}
+    return {"service": "AiCupid-backend", "docs": "/docs"}
 
 @app.get("/health")
-async def health():
+def health():
     return {"status": "ok", "service": "AiCupid-backend"}
 
-@app.get("/api/hello")
-async def hello(name: str = "Guest"):
-    return {"message": f"Hello, {name}!", "timestamp": datetime.now().isoformat()}
 
-@app.post("/invoke")
-async def invoke(data: dict):
+# --- 음성 → 텍스트 (LangGraph + Gemini) ---
+
+_AUDIO_TO_TEXT_RUNNABLE = None
+
+
+def _get_audio_to_text_runnable():
+    global _AUDIO_TO_TEXT_RUNNABLE
+    if _AUDIO_TO_TEXT_RUNNABLE is None:
+        _AUDIO_TO_TEXT_RUNNABLE = build_audio_to_text_graph().compile()
+    return _AUDIO_TO_TEXT_RUNNABLE
+
+
+# 업로드 허용 MIME (Gemini 지원 형식)
+AUDIO_MIME_TYPES = {
+    "audio/wav",
+    "audio/wave",
+    "audio/x-wav",
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/ogg",
+    "audio/webm",
+    "audio/flac",
+    "audio/mp4",
+}
+
+
+@app.post("/api/audio-to-text")
+async def audio_to_text(
+    file: Annotated[UploadFile, File(description="음성 파일 (wav, mp3, ogg, webm, flac 등)")],
+):
+    """
+    음성 파일을 업로드하면 Gemini로 텍스트로 변환해 반환합니다.
+    LangGraph로 변환 파이프라인을 구성합니다.
+    """
+    if not file.content_type or file.content_type.lower() not in AUDIO_MIME_TYPES:
+        # content_type이 비어 있거나 목록에 없으면 파일 확장자로 추정
+        name = (file.filename or "").lower()
+        if not any(name.endswith(ext) for ext in (".wav", ".mp3", ".ogg", ".webm", ".flac", ".m4a", ".mp4")):
+            raise HTTPException(
+                status_code=400,
+                detail=f"지원 형식: {', '.join(sorted(AUDIO_MIME_TYPES))}. filename 또는 Content-Type 필요.",
+            )
+        mime_type = "audio/wav"
+        if name.endswith(".mp3") or name.endswith(".mpeg"):
+            mime_type = "audio/mpeg"
+        elif name.endswith(".ogg"):
+            mime_type = "audio/ogg"
+        elif name.endswith(".webm"):
+            mime_type = "audio/webm"
+        elif name.endswith(".flac"):
+            mime_type = "audio/flac"
+        elif name.endswith(".mp4") or name.endswith(".m4a"):
+            mime_type = "audio/mp4"
+    else:
+        mime_type = file.content_type.lower()
+
     try:
-        runnable = get_app_runnable()
+        audio_bytes = await file.read()
     except Exception as e:
-        return JSONResponse(
-            status_code=503,
-            content={"error": f"퀴즈 엔진 초기화 실패: {e}"},
-        )
+        raise HTTPException(status_code=400, detail=f"파일 읽기 실패: {e}")
 
-    user_input = data.get("input")
-    if not user_input:
-        return JSONResponse(status_code=400, content={"error": "Input message is required"})
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="빈 파일입니다.")
 
-    current_state = data.get("state", {"messages": [], "question_id": 0, "score": 0})
-    current_state["messages"] = current_state.get("messages", []) + [("user", user_input)]
+    try:
+        runnable = _get_audio_to_text_runnable()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"엔진 초기화 실패 (GEMINI_API_KEY 확인): {e}")
 
-    result = runnable.invoke(current_state)
-    last_ai_message = ""
-    for role, msg in reversed(result["messages"]):
-        if role == "ai":
-            last_ai_message = msg
-            break
-    return {"response": last_ai_message, "state": result}
+    state = {
+        "audio_bytes": audio_bytes,
+        "mime_type": mime_type,
+        "text": "",
+        "error": "",
+    }
+    result = runnable.invoke(state)
+
+    if result.get("error"):
+        raise HTTPException(status_code=502, detail=result["error"])
+
+    return {"text": result.get("text", "")}
 
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+@app.websocket("/ws/quiz") # 사용자님 전용 엔드포인트 분리
+async def websocket_quiz_endpoint(websocket: WebSocket):
     await websocket.accept()
     
     session_id = websocket.query_params.get("session_id", str(uuid4()))
-    config = {"configurable": {"thread_id": session_id}}
-
-    runnable = get_app_runnable()
+    config = {"configurable": {"thread_id": session_id}} # 세션 유지
+    
+    runnable = get_compiled_graph()
     audio_chunks = []
 
     try:
@@ -68,59 +136,28 @@ async def websocket_endpoint(websocket: WebSocket):
             elif "text" in message:
                 data = json.loads(message["text"])
                 
+                # 'speech_end' 신호 시 사용자님만의 STT -> Agent -> TTS 루프 실행
                 if data.get("type") == "speech_end" and audio_chunks:
-                    sample_rate = int(data.get("sample_rate", 16000))
                     raw_pcm = b"".join(audio_chunks)
-                    audio_chunks = [] # 청크 초기화
+                    audio_chunks = []
                     
-                    # 1. STT
-                    transcript = await speech_to_text_gemini(raw_pcm, sample_rate)
+                    # 1. STT (사용자 기능)
+                    transcript = await speech_to_text_gemini(raw_pcm)
                     await websocket.send_json({"type": "final_transcript", "text": transcript})
 
-                    # 2. Agent 호출 (LangGraph)
-                    # 메시지가 비어있을 경우를 대비한 안전한 호출
-                    result = runnable.invoke({"messages": [("user", transcript)]}, config=config)
+                    # 2. Agent (사용자 기능 + 기반 구조)
+                    result = await runnable.ainvoke({"messages": [("user", transcript)]}, config=config)
                     
-                    # 3. AI 답변 추출 (안전한 방식)
-                    ai_text = ""
-                    for role, msg in reversed(result["messages"]):
-                        if role == "ai":
-                            ai_text = msg.content if hasattr(msg, 'content') else str(msg)
-                            break
-                    
-                    if not ai_text: ai_text = "죄송해요, 이해하지 못했어요."
-                    
+                    # 3. AI 답변 추출
+                    ai_text = result["messages"][-1][1] if result["messages"] else "죄송해요."
                     await websocket.send_json({"type": "ai_response_text", "text": ai_text})
 
-                    # 4. TTS (OpenAI TTS)
-                    audio_content = await text_to_speech_openai(ai_text) 
-
-                    # 중복되는 send_bytes는 삭제하고, JSON 규격에만 맞춰서 보냅니다.
+                    # 4. OpenAI TTS (사용자 기능)
+                    audio_content = await text_to_speech_openai(ai_text)
                     await websocket.send_json({
                         "type": "audio",
                         "data": base64.b64encode(audio_content).decode("utf-8"),
-                        "mime_type": "audio/wav" # 문규격에 맞춰 wav로 명시
+                        "mime_type": "audio/wav"
                     })
     except WebSocketDisconnect:
-        print(f"Client disconnected: {session_id}")
-    except Exception as e:
-        print(f"Error: {e}")
-        await websocket.send_json({"type": "error", "message": str(e)})
-
-@app.post("/upload-profile-image/")
-async def create_upload_file(file: UploadFile = File(...)):
-    """
-    프로필 이미지를 S3에 업로드하고 이미지 URL을 반환합니다.
-    """
-    if not file:
-        return {"message": "No upload file sent"}
-    
-    # 실제 프로덕션에서는 파일 이름을 고유하게 만드는 것이 좋습니다.
-    # 예: object_name = f"profile_images/{uuid4()}-{file.filename}"
-    
-    file_url = upload_file_to_s3(file, file.filename)
-
-    if file_url:
-        return {"message": "File uploaded successfully", "file_url": file_url}
-    else:
-        return JSONResponse(status_code=500, content={"message": "File upload failed"})
+        print(f"Disconnected: {session_id}")

@@ -3,12 +3,18 @@ langchain-core>=0.2.0
 
 # LangChain Community and specific integrations
 langchain-community
+fastapi
+google-genai
+langchain
+langchain-core
 langchain-google-genai
 langchain-openai
 langgraph
 langgraph-checkpoint-sqlite
 
 # Pydantic v2 is now compatible with recent langchain versions
+langgraph-cli
+langsmith
 pydantic
 
 # Application Server and Framework
@@ -20,6 +26,9 @@ fastapi
 elevenlabs
 google-cloud-texttospeech
 python-dotenv
-boto3
 gtts
+langgraph-checkpoint-sqlite
+openai
 python-multipart
+sqlalchemy
+boto3

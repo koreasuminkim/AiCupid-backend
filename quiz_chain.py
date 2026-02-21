@@ -2,18 +2,47 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 from langchain_core.output_parsers.json import JsonOutputParser
+from typing import Optional
 import json
 
 # LLM 모델 초기화 (창의적인 질문 생성을 위해 temperature를 약간 높임)
 llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.7)
 
+# 고정 퀴즈 데이터 (aicupid_quiz 그래프용)
+quiz_data = [
+    {"question": "대한민국의 수도는 어디인가요?", "answer": "서울"},
+    {"question": "세상에서 가장 높은 산은 무엇인가요?", "answer": "에베레스트"},
+    {"question": "1+1은?", "answer": "2"},
+]
+
+
+def get_llm():
+    """LangGraph 등에서 사용할 LLM 싱글톤."""
+    return llm
+
+
+def get_react_chain():
+    """간단한 ReAct 스타일 체인 (호환용)."""
+    prompt = ChatPromptTemplate.from_messages([("user", "{input}")])
+    return prompt | llm
+
 # --- 퀴즈 진행 및 채점을 위한 도구(Tool) 정의 ---
 
 class QuestionProvider(BaseModel):
-    """사용자의 이전 대화 기록을 바탕으로 새로운 퀴즈 질문과 정답을 생성합니다."""
-    history: list = Field(description="전체 대화 기록")
+    """사용자의 이전 대화 기록을 바탕으로 새로운 퀴즈 질문과 정답을 생성합니다. question_id가 있으면 quiz_data에서 질문을 반환합니다."""
+    history: list = Field(default_factory=list, description="전체 대화 기록")
+    question_id: Optional[int] = Field(default=None, description="고정 퀴즈 인덱스 (quiz_data 사용 시)")
 
-    def get_question(self) -> dict:
+    def get_question(self):
+        """question_id가 있으면 해당 질문 문자열을, 없으면 LLM으로 생성한 질문/정답 dict를 반환합니다."""
+        if self.question_id is not None and 0 <= self.question_id < len(quiz_data):
+            return quiz_data[self.question_id]["question"]
+        if not self.history:
+            return quiz_data[0]["question"] if quiz_data else "퀴즈가 없습니다."
+        r = self._get_question_from_llm()
+        return r.get("question", "퀴즈가 없습니다.") if isinstance(r, dict) else r
+
+    def _get_question_from_llm(self) -> dict:
         """LLM을 사용하여 새로운 질문과 정답을 생성하고 JSON으로 반환합니다."""
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -49,13 +78,20 @@ class QuestionProvider(BaseModel):
 
 
 class QuizGrader(BaseModel):
-    """사용자의 답변이 주어진 정답과 일치하는지 채점합니다."""
+    """사용자의 답변이 주어진 정답과 일치하는지 채점합니다. question_id가 있으면 quiz_data를 사용합니다."""
     user_answer: str = Field(description="사용자의 답변")
-    question: str = Field(description="채점할 질문")
-    correct_answer: str = Field(description="미리 생성된 정답")
+    question_id: Optional[int] = Field(default=None, description="고정 퀴즈 인덱스 (quiz_data 사용 시)")
+    question: Optional[str] = Field(default=None, description="채점할 질문")
+    correct_answer: Optional[str] = Field(default=None, description="미리 생성된 정답")
     
     def grade(self) -> bool:
-        """LLM을 사용하여 사용자의 답변을 채점하고 정답 여부를 반환합니다."""
+        """question_id가 있으면 quiz_data로 채점, 없으면 question/correct_answer로 LLM 채점합니다."""
+        if self.question_id is not None and 0 <= self.question_id < len(quiz_data):
+            q = quiz_data[self.question_id]
+            self.question = q["question"]
+            self.correct_answer = q["answer"]
+        if self.question is None or self.correct_answer is None:
+            return False
         prompt = ChatPromptTemplate.from_messages(
             [
                 (
