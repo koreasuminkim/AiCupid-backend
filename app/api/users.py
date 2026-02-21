@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.user import User
+from app.schemas.user import UserProfile
 from app.schemas.user import ProfileUpdateRequest
 from app.api.auth import get_current_user
 from services.s3_service import upload_file_to_s3_raw
@@ -52,3 +53,19 @@ async def update_profile(
             "profileImage": current_user.profile_image_url
         }
     }
+
+@router.get("/me", response_model=UserProfile)
+async def get_my_profile(current_user: User = Depends(get_current_user)):
+    """
+    현재 로그인한 사용자의 프로필 정보를 가져옵니다. (마이페이지용)
+    """
+    return UserProfile(
+        userId=current_user.userId,
+        name=current_user.name,
+        gender=current_user.gender,
+        age=current_user.age,
+        interests=current_user.interests,
+        mbti=current_user.mbti,
+        bio=current_user.bio,
+        profileImage=current_user.profile_image_url
+    )
