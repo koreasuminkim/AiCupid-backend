@@ -1,0 +1,13 @@
+node_modules/
+dist/
+
+# Environment variables (API keys — DO NOT commit)
+.env
+
+# SQLite database files
+*.db
+*.db-shm
+*.db-wal
+
+# macOS
+.DS_Store
