@@ -1,4 +1,5 @@
 import base64
+import json
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -12,6 +13,15 @@ from services.s3_service import upload_file_to_s3_raw
 from fastapi import Query
 from sqlalchemy import func
 from services.youtube_service import fetch_youtube_subscriptions, analyze_interests_with_llm
+from langchain_core.messages import SystemMessage, HumanMessage
+from quiz_chain import get_llm
+from app.schemas.user import (
+    UserProfile, 
+    ProfileUpdateRequest, 
+    MatchableUserListResponse, 
+    MatchableUserResponse, 
+    CompatibilityResponse
+)
 
 router = APIRouter(prefix="/api/users", tags=["users"])
 
@@ -219,3 +229,42 @@ async def sync_youtube_interests(
             "interests": current_user.interests,
         }
     }
+
+@router.get("/{partner_id}/compatibility", response_model=CompatibilityResponse)
+async def get_user_compatibility(
+    partner_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    partner = db.query(User).filter(User.userId == partner_id).first()
+    if not partner:
+        raise HTTPException(status_code=404, detail="상대방을 찾을 수 없습니다.")
+
+    llm = get_llm()
+    
+    system_prompt = """당신은 연애 과학자입니다. 
+    두 사람의 정보를 분석해 결과를 내놓으세요. 
+    1. MBTI 시너지: MBTI 유형 간의 시너지와 잠재적 갈등을 분석해 간략히 설명하세요.
+    2. 관심사 공통점: 두 사람의 관심사에서 공통점과 차이점을 분석해 간략히 설명하세요.'
+    3. 성공 확률: MBTI 시너지와 관심사 공통점을 종합해 이 커플의 성공 확률을 0~100 사이 숫자로 제시하세요.
+    4. 총평: 전체적인 궁합에 대한 한 줄 평을 제시하세요.
+    반드시 JSON으로만 출력하세요:
+    {
+      "mbti_compatibility": "MBTI 시너지 (1~2문장)",
+      "interest_overlap": "관심사 공통점 (1~2문장)",
+      "success_probability": 0~100 사이 숫자,
+      "summary": "총평 한 줄"
+    }"""
+
+    user_info = f"나: MBTI({current_user.mbti}), 관심사({current_user.interests}) / 상대방: 이름({partner.name}), MBTI({partner.mbti}), 관심사({partner.interests})"
+
+    messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_info)]
+    
+    try:
+        response = await llm.ainvoke(messages)
+        content = response.content.strip()
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        return json.loads(content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="분석 실패")
