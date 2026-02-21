@@ -1,3 +1,4 @@
+import os
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
@@ -10,10 +11,11 @@ _llm = None
 
 
 def get_llm():
-    """LangGraph 등에서 사용할 LLM 싱글톤. 첫 호출 시에만 생성."""
+    """LangGraph 등에서 사용할 LLM 싱글톤. GEMINI_API_KEY만 사용."""
     global _llm
     if _llm is None:
-        _llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.7)
+        api_key = os.environ.get("GEMINI_API_KEY")
+        _llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.7, api_key=api_key)
     return _llm
 
 

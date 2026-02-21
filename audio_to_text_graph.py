@@ -25,7 +25,7 @@ def _transcribe_node(state: AudioToTextState) -> dict:
     from google import genai
     from google.genai import types
 
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         return {"text": "", "error": "GEMINI_API_KEY not set"}
 

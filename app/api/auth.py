@@ -85,7 +85,21 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)):
         }
     }
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+
+# Swagger Authorize용: OAuth2 형식(form)으로 받아 access_token 반환
+@router.post("/token")
+async def login_token(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    """
+    Swagger/OpenAPI Authorize 버튼용. username에 userId, password에 비밀번호를 넣으세요.
+    """
+    user = db.query(User).filter(User.userId == form.username).first()
+    if not user or not PWD_CONTEXT.verify(form.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="아이디 또는 비밀번호 오류")
+    token = jwt.encode({"sub": user.userId}, SECRET_KEY, algorithm=ALGORITHM)
+    return {"access_token": token, "token_type": "bearer"}
+
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/token")
 
 async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     credentials_exception = HTTPException(
