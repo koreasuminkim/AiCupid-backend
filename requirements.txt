@@ -20,4 +20,6 @@ fastapi
 elevenlabs
 google-cloud-texttospeech
 python-dotenv
+boto3
 gtts
+python-multipart

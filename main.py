@@ -1,12 +1,14 @@
 import json
 import base64
 from datetime import datetime
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile
 from fastapi.responses import JSONResponse
 from uuid import uuid4
+from typing import Optional
 
 from services.agent import get_app_runnable
 from services.voice import speech_to_text_gemini, text_to_speech_openai
+from services.s3_service import upload_file_to_s3
 
 app = FastAPI()
 
@@ -104,3 +106,21 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         print(f"Error: {e}")
         await websocket.send_json({"type": "error", "message": str(e)})
+
+@app.post("/upload-profile-image/")
+async def create_upload_file(file: UploadFile = File(...)):
+    """
+    프로필 이미지를 S3에 업로드하고 이미지 URL을 반환합니다.
+    """
+    if not file:
+        return {"message": "No upload file sent"}
+    
+    # 실제 프로덕션에서는 파일 이름을 고유하게 만드는 것이 좋습니다.
+    # 예: object_name = f"profile_images/{uuid4()}-{file.filename}"
+    
+    file_url = upload_file_to_s3(file, file.filename)
+
+    if file_url:
+        return {"message": "File uploaded successfully", "file_url": file_url}
+    else:
+        return JSONResponse(status_code=500, content={"message": "File upload failed"})
