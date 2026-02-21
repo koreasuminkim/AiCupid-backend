@@ -1,10 +1,10 @@
-langchain
-langchain-core
-langchain-google-genai
-pydantic
+langchain==0.1.16
+langchain-core==0.1.45
+langchain-google-genai==1.0.0
+pydantic==1.10.13
 uvicorn
 fastapi
 gunicorn
-google-cloud-speech
-elevenlabs
 python-dotenv
+elevenlabs
+google-cloud-speech
