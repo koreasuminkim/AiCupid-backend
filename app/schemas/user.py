@@ -113,15 +113,6 @@ class MatchableUserResponse(BaseModel):
     interests: List[str] = []
     profileImage: Optional[str] = None
 
-class MatchableUserResponse(BaseModel):
-    userId: str
-    name: str
-    age: int
-    gender: str
-    mbti: Optional[str] = None
-    interests: List[str] = []
-    profileImage: Optional[str] = None
-
 class MatchableUserListResponse(BaseModel):
     users: List[MatchableUserResponse]
     total_count: int
