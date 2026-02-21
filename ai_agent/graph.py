@@ -10,8 +10,7 @@ from typing import Annotated, TypedDict
 
 from langgraph.graph import END, StateGraph
 
-from quiz_chain import QuizGrader, QuestionProvider, quiz_data, get_react_chain
-from langchain_google_genai import ChatGoogleGenerativeAI
+from quiz_chain import QuizGrader, QuestionProvider, quiz_data, get_llm, get_react_chain
 
 
 class AgentState(TypedDict):
@@ -24,9 +23,7 @@ class AgentState(TypedDict):
 
 
 def build_quiz_graph() -> StateGraph:
-    """퀴즈/채팅 LangGraph를 빌드하여 반환 (compile은 호출 측에서)."""
-    llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0)
-    react_chain = get_react_chain()
+    """퀴즈/채팅 LangGraph를 빌드하여 반환 (compile은 호출 측에서). LLM은 첫 실행 시 로드."""
 
     def router_node(state: AgentState):
         last_message = state["messages"][-1]
@@ -74,7 +71,7 @@ def build_quiz_graph() -> StateGraph:
         return {"messages": [("ai", message)]}
 
     def chat_node(state: AgentState):
-        response = llm.invoke(state["messages"])
+        response = get_llm().invoke(state["messages"])
         return {"messages": [response]}
 
     def decide_next_step(state: AgentState):

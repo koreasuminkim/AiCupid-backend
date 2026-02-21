@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "aicupid_quiz": "./src/agent.py:agent"
+  },
+  "env": ".env"
+}

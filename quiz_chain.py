@@ -2,8 +2,17 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
-# LLM 모델 초기화
-llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0)
+# LLM은 첫 사용 시에만 생성 (langgraph dev 로드 시 GEMINI_API_KEY 없어도 그래프 구조는 로드됨)
+_llm = None
+
+
+def get_llm():
+    global _llm
+    if _llm is None:
+        from dotenv import load_dotenv
+        load_dotenv()
+        _llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0)
+    return _llm
 
 # 퀴즈 질문과 정답 데이터
 quiz_data = [
@@ -47,7 +56,7 @@ grade_answer_prompt = ChatPromptTemplate.from_messages(
 )
 
 def get_grading_chain():
-    return grade_answer_prompt | llm
+    return grade_answer_prompt | get_llm()
 
 # 다음 행동을 결정하기 위한 프롬프트 및 체인
 # 이 체인은 LLM이 다음에 어떤 도구(QuizGrader, QuestionProvider)를 사용해야 할지 결정하도록 합니다.
@@ -73,7 +82,4 @@ react_prompt = """당신은 대화의 흐름을 관리하는 AI 에이전트입�
 """
 
 def get_react_chain():
-    # llm_with_tools = llm.bind_tools([QuizGrader, QuestionProvider])
-    # 이 부분은 추후 LangGraph의 AgentExecutor와 통합됩니다.
-    # 지금은 개념 설명을 위해 프롬프트를 통한 의사결정 체인을 구성합니다.
-    return ChatPromptTemplate.from_template(react_prompt) | llm
+    return ChatPromptTemplate.from_template(react_prompt) | get_llm()
