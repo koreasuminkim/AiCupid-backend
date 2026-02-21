@@ -64,3 +64,28 @@ class ProfileUpdateRequest(BaseModel):
     mbti: Optional[str] = None
     bio: Optional[str] = None
     profileImage: Optional[str] = None # Base64 string
+
+class MatchableUserListResponse(BaseModel):
+    users: List[UserProfile]
+
+class MatchableUserResponse(BaseModel):
+    userId: str
+    name: str
+    age: int
+    gender: str
+    mbti: Optional[str] = None
+    interests: List[str] = []
+    profileImage: Optional[str] = None
+
+class MatchableUserResponse(BaseModel):
+    userId: str
+    name: str
+    age: int
+    gender: str
+    mbti: Optional[str] = None
+    interests: List[str] = []
+    profileImage: Optional[str] = None
+
+class MatchableUserListResponse(BaseModel):
+    users: List[MatchableUserResponse]
+    total_count: int
