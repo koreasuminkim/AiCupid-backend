@@ -1,15 +1,19 @@
 import os
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from dotenv import load_dotenv
 
 # API 라우터 임포트
+from app.database import engine, Base
 from app.api.auth import router as auth_router
 from app.api.voice import router as voice_router
 from app.api.ws import router as ws_router
 from app.api.agent import router as agent_router # 기존 파일 유지 시
 
 load_dotenv()
+
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="AiCupid Backend API",
@@ -19,6 +23,15 @@ API 문서입니다.
 **WebSocket 연결 테스트:** [소켓 테스트 페이지](/docs/websocket-test)  
 → `/ws/quiz-text`, `/ws/live`, `/ws/audio` 연결·텍스트 전송·수신 로그 확인
 """,
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # 일단 모두 허용
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # 라우터 등록

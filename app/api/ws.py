@@ -3,7 +3,7 @@ import base64
 from uuid import uuid4
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from services.voice import speech_to_text_gemini, text_to_speech_openai
-from ai_agent.graph import get_compiled_graph
+from services.agent import get_app_runnable
 from live_bridge import run_live_session
 
 router = APIRouter(prefix="/ws", tags=["websocket"])
@@ -12,7 +12,7 @@ async def _run_quiz_voice_loop(websocket: WebSocket):
     """음성 청크 수신 → STT → 퀴즈 에이전트 → TTS 응답 (공통 로직)."""
     session_id = websocket.query_params.get("session_id", str(uuid4()))
     config = {"configurable": {"thread_id": session_id}}
-    runnable = get_compiled_graph()
+    runnable = get_app_runnable() 
     audio_chunks = []
 
     try:

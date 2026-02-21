@@ -32,3 +32,6 @@ openai
 python-multipart
 sqlalchemy
 boto3
+passlib[bcrypt]
+python-jose[cryptography]
+python-multipart

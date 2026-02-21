@@ -48,3 +48,16 @@ def upload_file_to_s3(file, object_name=None):
     except Exception as e:
         print(f"An error occurred: {e}")
         return None
+
+def upload_file_to_s3_raw(file_bytes, object_name, ext):
+    try:
+        s3_client.put_object(
+            Bucket=S3_BUCKET_NAME,
+            Key=object_name,
+            Body=file_bytes,
+            ContentType=f'image/{ext}' 
+        )
+        return f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{object_name}"
+    except Exception as e:
+        print(f"S3 Raw Upload Error: {e}")
+        return None
