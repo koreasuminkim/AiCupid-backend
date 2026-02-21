@@ -2,7 +2,8 @@ import operator
 import sqlite3
 from typing import TypedDict, Annotated
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.postgres import PostgresSaver
+from psycopg_pool import ConnectionPool
 
 # 지연 로딩을 위한 싱글톤 변수
 _app_runnable = None
@@ -80,7 +81,11 @@ def get_app_runnable():
 
     # --- SQLite 체크포인터 설정 ---
     # 파일 이름을 'checkpoints.db'로 설정하여 데이터를 로컬에 물리적으로 저장합니다.
-    memory = SqliteSaver.from_conn_string("checkpoints.db")
-    _app_runnable = workflow.compile(checkpointer=memory)
-    
+    DB_URI = os.getenv("DATABASE_URL")
+    # LangGraph PostgresSaver는 별도의 풀이나 연결이 필요함
+    pool = ConnectionPool(conninfo=DB_URI, max_size=20)
+    memory = PostgresSaver(pool)
+    # 주의: 서버 시작 시 memory.setup()을 호출해야 테이블이 생성됨
+    _app_runnable = workflow.compile(checkpointer=memory)    
+
     return _app_runnable
