@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import os
+import re
 import uuid
 import wave
 from typing import Annotated
@@ -383,6 +384,104 @@ async def psych_test(
 
     return {
         "question": question,
+        "audio": audio_b64,
+        "mime_type": mime_type,
+    }
+
+
+# ----- 심리 테스트 결과 분석: 음성 2개(대화 내역) + 세션 → 궁합 점수·텍스트·음성 -----
+
+
+def _parse_score_and_result(llm_output: str) -> tuple[int, str]:
+    """LLM 출력에서 점수와 결과 문단 파싱. 기본: 0~100, 전체를 result로."""
+    text = (llm_output or "").strip()
+    score = 0
+    result = text
+    # "SCORE: 85" 또는 "점수: 85" 등
+    score_match = re.search(r"(?:SCORE|점수)\s*[:：]\s*(\d+)", text, re.IGNORECASE)
+    if score_match:
+        score = min(100, max(0, int(score_match.group(1))))
+    # "RESULT:" 또는 "결과:" 이후를 결과 텍스트로
+    result_match = re.search(r"(?:RESULT|결과)\s*[:：]\s*(.+)", text, re.DOTALL | re.IGNORECASE)
+    if result_match:
+        result = result_match.group(1).strip()
+    else:
+        # 점수 줄을 제거한 나머지를 결과로
+        result = re.sub(r"(?i)(?:SCORE|점수)\s*[:：]\s*\d+\s*", "", text).strip() or text
+    return score, result
+
+
+@router.post("/psych-test-result")
+async def psych_test_result(
+    session_id: Annotated[str, Form(description="세션 ID")],
+    file_1: Annotated[UploadFile, File(description="참가자 1 대화 내역 음성 파일")],
+    file_2: Annotated[UploadFile, File(description="참가자 2 대화 내역 음성 파일")],
+    db: Session = Depends(get_db),
+):
+    """
+    세션 ID + 대화 내역 음성 파일 2개를 받아, 두 참가자의 심리 테스트 응답을 전사하고
+    궁합 분석 결과(점수 + 텍스트)를 생성한 뒤, 결과 텍스트를 TTS로 음성까지 만들어
+    점수·텍스트·음성을 함께 반환합니다.
+    """
+    session_id = (session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id는 필수입니다.")
+
+    # 음성 2개 전사
+    _, _, transcript_1 = await _read_audio_and_transcribe(file_1)
+    _, _, transcript_2 = await _read_audio_and_transcribe(file_2)
+
+    # 세션 대화 히스토리 (선택 컨텍스트)
+    turns = (
+        db.query(VoiceConversationTurn)
+        .filter(VoiceConversationTurn.session_id == session_id)
+        .order_by(VoiceConversationTurn.created_at)
+        .all()
+    )
+    history_lines = []
+    for t in turns:
+        if t.user_text:
+            history_lines.append(f"- user: {t.user_text}")
+        history_lines.append(f"- ai: {t.assistant_reply or ''}")
+    history_block = "\n".join(history_lines) if history_lines else "(없음)"
+
+    from quiz_chain import get_llm
+
+    system = (
+        f"{AI_MC_SYSTEM_PROMPT.strip()}\n\n"
+        "역할: 당신은 **MC**이자 **심리 테스트 분석가**입니다. "
+        "두 참가자가 심리 테스트에 답한 내용(전사)을 바탕으로 **궁합 분석**을 한 뒤, "
+        "다음 형식으로만 출력하세요.\n"
+        "1) 첫 줄: SCORE: (0~100 사이 정수 하나)\n"
+        "2) 둘째 줄부터: RESULT: (두 분의 궁합을 2~4문장으로 친절히 설명, 한국어)"
+    )
+    user_content = (
+        "[참가자 1의 답변 전사]\n"
+        f"{transcript_1 or '(없음)'}\n\n"
+        "[참가자 2의 답변 전사]\n"
+        f"{transcript_2 or '(없음)'}\n\n"
+        "[이 세션의 지금까지 대화]\n"
+        f"{history_block}\n\n"
+        "위를 바탕으로 궁합 점수(0~100)와 결과 문단을 SCORE: / RESULT: 형식으로 출력하세요."
+    )
+    messages = [
+        SystemMessage(content=system),
+        HumanMessage(content=user_content),
+    ]
+    try:
+        response = get_llm().invoke(messages)
+        raw = (response.content if hasattr(response, "content") else str(response)).strip()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    score, result_text = _parse_score_and_result(raw)
+
+    # 결과 텍스트 → TTS 음성
+    audio_b64, mime_type = _reply_and_tts(result_text)
+
+    return {
+        "score": score,
+        "result_text": result_text,
         "audio": audio_b64,
         "mime_type": mime_type,
     }
