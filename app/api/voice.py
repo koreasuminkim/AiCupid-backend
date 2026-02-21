@@ -10,7 +10,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -997,4 +997,140 @@ async def quiz_result(
         "question_text": quiz.question_text,
         "correct_answer": correct_answer,
         "user_answer": user_answer,
+    }
+
+
+# ----- 케미 결과: 세션 ID → 대화 히스토리 + 두 유저 프로필 → LLM 케미 분석 요약·지수 + TTS + 프로필 -----
+
+
+def _user_to_profile_dict(u: User) -> dict:
+    """User 모델을 프론트용 프로필 dict로 변환 (비밀번호 등 제외)."""
+    interests = getattr(u, "interests", None)
+    if interests is None:
+        interests = []
+    if isinstance(interests, str):
+        try:
+            interests = json.loads(interests) if interests else []
+        except Exception:
+            interests = []
+    return {
+        "userId": u.userId,
+        "name": u.name,
+        "gender": u.gender or "",
+        "age": u.age,
+        "interests": interests if isinstance(interests, list) else [],
+        "mbti": getattr(u, "mbti", None) or None,
+        "bio": getattr(u, "bio", None) or None,
+        "profileImage": getattr(u, "profile_image_url", None) or None,
+    }
+
+
+class ChemistryResultRequest(BaseModel):
+    session_id: str
+
+
+@router.post("/chemistry-result")
+async def chemistry_result(
+    body: ChemistryResultRequest = Body(...),
+    db: Session = Depends(get_db),
+):
+    """
+    세션 ID를 받아, 해당 세션의 과거 대화 히스토리와 두 참가자 프로필을 바탕으로
+    LLM 케미 분석 요약(텍스트), 케미 지수(퍼센트), 해당 내용 전체 TTS, 두 유저 기본 프로필을 반환합니다.
+    """
+    session_id = (body.session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id는 필수입니다.")
+
+    session = (
+        db.query(VoiceSession)
+        .filter(VoiceSession.session_id == session_id)
+        .first()
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="해당 세션을 찾을 수 없습니다.")
+
+    turns = (
+        db.query(VoiceConversationTurn)
+        .filter(VoiceConversationTurn.session_id == session_id)
+        .order_by(VoiceConversationTurn.created_at)
+        .all()
+    )
+    history_lines = []
+    for t in turns:
+        if t.user_text:
+            history_lines.append(f"- 참가자: {t.user_text}")
+        if t.assistant_reply:
+            history_lines.append(f"- MC: {t.assistant_reply}")
+    history_block = "\n".join(history_lines) if history_lines else "(대화 내역 없음)"
+
+    user_1 = (
+        db.query(User)
+        .options(load_only(User.userId, User.name, User.gender, User.age, User.interests, User.mbti, User.bio, User.profile_image_url))
+        .filter(User.userId == session.user_id_1)
+        .first()
+    )
+    user_2 = (
+        db.query(User)
+        .options(load_only(User.userId, User.name, User.gender, User.age, User.interests, User.mbti, User.bio, User.profile_image_url))
+        .filter(User.userId == session.user_id_2)
+        .first()
+    )
+    profile_1 = _user_to_profile_dict(user_1) if user_1 else None
+    profile_2 = _user_to_profile_dict(user_2) if user_2 else None
+
+    from quiz_chain import get_llm
+
+    profile_1_str = json.dumps(profile_1, ensure_ascii=False) if profile_1 else "정보 없음"
+    profile_2_str = json.dumps(profile_2, ensure_ascii=False) if profile_2 else "정보 없음"
+
+    system = (
+        "당신은 소개팅/미팅 케미 분석가입니다. "
+        "참가자 둘의 대화 내역과 프로필을 보고, 두 사람의 **케미(궁합·분위기)** 를 분석해 주세요. "
+        "반드시 아래 형식으로만 출력하세요. 다른 설명은 붙이지 마세요.\n\n"
+        "SUMMARY: (2~4문장으로 케미 요약, 친절하고 재미있게)\n"
+        "CHEMISTRY_PERCENT: (0~100 사이 정수 하나만)"
+    )
+    user_content = (
+        "[참가자1 프로필]\n" + profile_1_str + "\n\n"
+        "[참가자2 프로필]\n" + profile_2_str + "\n\n"
+        "[대화 내역]\n" + history_block + "\n\n"
+        "위 프로필과 대화를 바탕으로 케미 요약(SUMMARY)과 케미 지수(CHEMISTRY_PERCENT, 0~100)를 출력하세요."
+    )
+    messages = [SystemMessage(content=system), HumanMessage(content=user_content)]
+    try:
+        response = get_llm().invoke(messages)
+        raw = (response.content if hasattr(response, "content") else str(response)).strip()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"케미 분석 생성 실패: {e}")
+
+    summary = ""
+    chemistry_percent = 50
+    for line in raw.split("\n"):
+        line = line.strip()
+        if line.upper().startswith("SUMMARY:"):
+            summary = line.split(":", 1)[-1].strip()
+        elif line.upper().startswith("CHEMISTRY_PERCENT:"):
+            try:
+                chemistry_percent = int(line.split(":", 1)[-1].strip().strip("%"))
+                chemistry_percent = max(0, min(100, chemistry_percent))
+            except (ValueError, TypeError):
+                pass
+
+    if not summary:
+        summary = "대화가 짧아 케미를 충분히 파악하기 어렵습니다. 더 대화해 보세요!"
+
+    full_script = (
+        f"두 분의 케미 분석 결과입니다. {summary} "
+        f"케미 지수는 {chemistry_percent}퍼센트입니다."
+    )
+    audio_b64, mime_type = _reply_and_tts(full_script)
+
+    return {
+        "summary": summary,
+        "chemistry_percent": chemistry_percent,
+        "audio": audio_b64,
+        "mime_type": mime_type,
+        "user_1_profile": profile_1,
+        "user_2_profile": profile_2,
     }
