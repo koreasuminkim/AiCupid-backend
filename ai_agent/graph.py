@@ -10,8 +10,6 @@ from typing import Annotated, TypedDict
 
 from langgraph.graph import END, StateGraph
 
-from langgraph.checkpoint.sqlite import SqliteSaver # 사용자 기능 추가
-
 from quiz_chain import QuizGrader, QuestionProvider, quiz_data, get_llm, get_react_chain
 
 
@@ -123,14 +121,13 @@ def build_quiz_graph() -> StateGraph:
 
 _compiled_graph = None
 
+
 def get_compiled_graph():
     """
-    사용자 기능 코드의 SqliteSaver를 기반 구조에 통합.
-    세션 유지를 위해 SQLite 체크포인터가 설정된 그래프를 반환합니다.
+    퀴즈 그래프를 컴파일해 반환합니다.
+    (SqliteSaver 사용 시: pip install langgraph-checkpoint-sqlite 후 checkpointer 인자 추가 가능)
     """
     global _compiled_graph
     if _compiled_graph is None:
-        # DB 파일 이름은 기존 기능 코드와 동일하게 유지
-        memory = SqliteSaver.from_conn_string("checkpoints.db")
-        _compiled_graph = build_quiz_graph().compile(checkpointer=memory)
+        _compiled_graph = build_quiz_graph().compile()
     return _compiled_graph
