@@ -10,3 +10,5 @@
 .DS_Store
 
 repomix-output.xml
+
+*.venv
