@@ -1,5 +1,7 @@
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy import Column, Integer, String, JSON
 from app.database import Base
+from app.database import engine
 
 class User(Base):
     __tablename__ = "users"
@@ -14,6 +16,6 @@ class User(Base):
     gender = Column(String, nullable=False)
     age = Column(Integer, nullable=False)
      # ["영화", "게임"] 형태
-    interests = Column(JSON, nullable=False)
+    interests = Column(JSONB if engine.name == 'postgresql' else JSON, nullable=False)
     mbti = Column(String, nullable=True) 
     bio = Column(String, nullable=True)

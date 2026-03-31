@@ -38,3 +38,6 @@ python-jose[cryptography]
 python-multipart
 email-validator
 requests
+psycopg2-binary
+langgraph-checkpoint-postgres
+psycopg-pool
